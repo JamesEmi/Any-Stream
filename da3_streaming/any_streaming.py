@@ -129,7 +129,7 @@ def remove_duplicates(data_list):
     return result
 
 
-class DA3_Streaming:
+class Any_Streaming:
     def __init__(self, image_dir, save_dir, config):
         self.config = config
 
@@ -164,15 +164,27 @@ class DA3_Streaming:
         self.delete_temp_files = self.config["Model"]["delete_temp_files"]
 
         print("Loading model...")
+        
+        model_type = self.config["Weights"]["model"]
 
-        with open(self.config["Weights"]["DA3_CONFIG"]) as f:
-            config = json.load(f)
-        self.model = DepthAnything3(**config)
-        weight = load_file(self.config["Weights"]["DA3"])
-        self.model.load_state_dict(weight, strict=False)
+        if model_type == "DA3":
+            with open(self.config["Weights"]["DA3_CONFIG"]) as f:
+                config = json.load(f)
+            self.model = DepthAnything3(**config)
+            weight = load_file(self.config["Weights"]["DA3"])
+            self.model.load_state_dict(weight, strict=False)
+            self.model.eval()
+            self.model = self.model.to(self.device)
 
-        self.model.eval()
-        self.model = self.model.to(self.device)
+        elif model_type == "MapAnything":
+            from .adapters.mapanything import MapAnythingAdapter
+            self.model = MapAnythingAdapter(device=self.device)
+            self.model.load()
+
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+
+        self.model_type = model_type 
 
         self.skyseg_session = None
 
@@ -266,21 +278,26 @@ class DA3_Streaming:
 
         torch.cuda.empty_cache()
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=self.dtype):
-                images = chunk_image_paths
-                # images: ['xxx.png', 'xxx.png', ...]
+            if self.model_type == "DA3":
+                with torch.cuda.amp.autocast(dtype=self.dtype):
+                    images = chunk_image_paths
+                    predictions = self.model.inference(
+                        images,
+                        ref_view_strategy=ref_view_strategy
+                    )
+                    predictions.depth = np.squeeze(predictions.depth)
+                    predictions.conf -= 1.0 # Conf correction for DA3
 
-                predictions = self.model.inference(images, ref_view_strategy=ref_view_strategy)
+            elif self.model_type == "MapAnything":
+                predictions = self.model.infer(chunk_image_paths)
 
-                predictions.depth = np.squeeze(predictions.depth)
-                predictions.conf -= 1.0
-
-                print(predictions.processed_images.shape)  # [N, H, W, 3] uint8
-                print(predictions.depth.shape)  # [N, H, W] float32
-                print(predictions.conf.shape)  # [N, H, W] float32
-                print(predictions.extrinsics.shape)  # [N, 3, 4] float32 (w2c)
-                print(predictions.intrinsics.shape)  # [N, 3, 3] float32
         torch.cuda.empty_cache()
+
+        print(f"predictions.processed_images.shape: {predictions.processed_images.shape}")  # [N, H, W, 3]
+        print(f"predictions.depth.shape: {predictions.depth.shape}")  # [N, H, W]
+        print(f"predictions.conf.shape: {predictions.conf.shape}")  # [N, H, W]
+        print(f"predictions.extrinsics.shape: {predictions.extrinsics.shape}")  # [N, 3, 4]
+        print(f"predictions.intrinsics.shape: {predictions.intrinsics.shape}")  # [N, 3, 3]
 
         # Save predictions to disk instead of keeping in memory
         if is_loop:
@@ -879,7 +896,7 @@ def copy_file(src_path, dst_dir):
 
 if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser(description="DA3-Streaming")
+    parser = argparse.ArgumentParser(description="Any-Streaming")
     parser.add_argument("--image_dir", type=str, required=True, help="Image path")
     parser.add_argument(
         "--config",
@@ -911,11 +928,11 @@ if __name__ == "__main__":
     if config["Model"]["align_lib"] == "numba":
         warmup_numba()
 
-    da3_streaming = DA3_Streaming(image_dir, save_dir, config)
-    da3_streaming.run()
-    da3_streaming.close()
+    any_streaming = Any_Streaming(image_dir, save_dir, config)
+    any_streaming.run()
+    any_streaming.close()
 
-    del da3_streaming
+    del any_streaming
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -923,5 +940,5 @@ if __name__ == "__main__":
     input_dir = os.path.join(save_dir, "pcd")
     print("Saving all the point clouds")
     merge_ply_files(input_dir, all_ply_path)
-    print("DA3-Streaming done.")
+    print("Any-Streaming done.")
     sys.exit()
