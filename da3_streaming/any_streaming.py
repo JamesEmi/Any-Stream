@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from datetime import datetime
 import matplotlib
 import matplotlib.pyplot as plt
@@ -164,7 +165,8 @@ class Any_Streaming:
         self.delete_temp_files = self.config["Model"]["delete_temp_files"]
 
         print("Loading model...")
-        
+        t_load = time.time()
+
         model_type = self.config["Weights"]["model"]
 
         if model_type == "DA3":
@@ -177,14 +179,20 @@ class Any_Streaming:
             self.model = self.model.to(self.device)
 
         elif model_type == "MapAnything":
-            from .adapters.mapanything import MapAnythingAdapter
+            from adapters.mapanything import MapAnythingAdapter
             self.model = MapAnythingAdapter(device=self.device)
             self.model.load()
 
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
-        self.model_type = model_type 
+        self.model_type = model_type
+        load_time = time.time() - t_load
+        print(f"Model loaded in {load_time:.2f}s")
+
+        self.log_file = os.path.join(save_dir, "timing.log")
+        with open(self.log_file, "w") as f:
+            f.write(f"model_load: {load_time:.2f}s\n")
 
         self.skyseg_session = None
 
@@ -277,6 +285,7 @@ class Any_Streaming:
         ]
 
         torch.cuda.empty_cache()
+        t_infer = time.time()
         with torch.no_grad():
             if self.model_type == "DA3":
                 with torch.cuda.amp.autocast(dtype=self.dtype):
@@ -291,6 +300,10 @@ class Any_Streaming:
             elif self.model_type == "MapAnything":
                 predictions = self.model.infer(chunk_image_paths)
 
+        infer_time = time.time() - t_infer
+        print(f"Inference time: {infer_time:.2f}s")
+        with open(self.log_file, "a") as f:
+            f.write(f"chunk_{chunk_idx}_infer: {infer_time:.2f}s\n")
         torch.cuda.empty_cache()
 
         print(f"predictions.processed_images.shape: {predictions.processed_images.shape}")  # [N, H, W, 3]
@@ -589,6 +602,7 @@ class Any_Streaming:
                     chunk1_depth_conf = None
                     chunk2_depth_conf = None
 
+                t_align = time.time()
                 s, R, t = self.align_2pcds(
                     point_map1,
                     conf1,
@@ -599,6 +613,10 @@ class Any_Streaming:
                     chunk1_depth_conf,
                     chunk2_depth_conf,
                 )
+                align_time = time.time() - t_align
+                print(f"Alignment time: {align_time:.2f}s")
+                with open(self.log_file, "a") as f:
+                    f.write(f"chunk_{chunk_idx-1}_to_{chunk_idx}_align: {align_time:.2f}s\n")
                 self.sim3_list.append((s, R, t))
 
             pre_predictions = cur_predictions

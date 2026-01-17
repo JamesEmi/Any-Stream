@@ -17,10 +17,10 @@ class MapAnythingAdapter:
         """Load MapAnything model."""
         from mapanything.models import MapAnything
         
-        self.model = MapAnything.from_pretrained("facebook/map-anything")
+        self.model = MapAnything.from_pretrained("facebook/map-anything-v1")
         self.model = self.model.to(self.device)
         self.model.eval()
-        print("MapAnything model loaded.")
+        print("MapAnything model - v1 loaded.")
 
     
     def infer(self, image_paths: List[str]) -> Predictions:
