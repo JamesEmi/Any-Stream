@@ -1,5 +1,5 @@
 Weights:
-  model: 'DA3' # DA3 or MapAnything
+  model: 'MapAnything' # DA3 or MapAnything
   DA3: './weights/model.safetensors'
   DA3_CONFIG: './weights/config.json'
   SALAD: './weights/dino_salad.ckpt'

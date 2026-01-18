@@ -55,6 +55,7 @@ class MapAnythingAdapter:
         intrinsics = []
         images_out = []
         masks = []
+        world_points_list = []
 
         for view_idx, pred in enumerate(outputs):
             # Extract data from predictions
@@ -63,8 +64,8 @@ class MapAnythingAdapter:
             camera_pose_c2w_torch = pred["camera_poses"][0]  # (4, 4)
             intrinsic_torch = pred["intrinsics"][0]  # (3, 3)
 
-            # Compute valid_mask from depth (same as demo_images_only_inference.py)
-            _, valid_mask = depthmap_to_world_frame(
+            # Compute world points and valid_mask from depth (same as demo_images_only_inference.py)
+            pts3d_computed, valid_mask = depthmap_to_world_frame(
                 depthmap_torch, intrinsic_torch, camera_pose_c2w_torch
             )
 
@@ -95,6 +96,7 @@ class MapAnythingAdapter:
             intrinsics.append(intrinsic)
             images_out.append(img)
             masks.append(mask)
+            world_points_list.append(pts3d_computed.cpu().numpy())  # (H, W, 3)
 
         return Predictions(
             depth=np.stack(depths),           # (N, H, W)

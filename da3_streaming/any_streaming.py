@@ -402,9 +402,12 @@ class Any_Streaming:
             chunk_a_range = item[0][1]
             chunk_b_range = item[0][3]
 
-            point_map_loop_org = depth_to_point_cloud_vectorized(
-                item[1].depth, item[1].intrinsics, item[1].extrinsics
-            )
+            if getattr(item[1], 'world_points', None) is not None:
+                point_map_loop_org = item[1].world_points
+            else:
+                point_map_loop_org = depth_to_point_cloud_vectorized(
+                    item[1].depth, item[1].intrinsics, item[1].extrinsics
+                )
 
             chunk_a_s = 0
             chunk_a_e = chunk_a_len = chunk_a_range[1] - chunk_a_range[0]
@@ -429,9 +432,12 @@ class Any_Streaming:
                 allow_pickle=True,
             ).item()
 
-            point_map_a = depth_to_point_cloud_vectorized(
-                chunk_data_a.depth, chunk_data_a.intrinsics, chunk_data_a.extrinsics
-            )
+            if getattr(chunk_data_a, 'world_points', None) is not None:
+                point_map_a = chunk_data_a.world_points
+            else:
+                point_map_a = depth_to_point_cloud_vectorized(
+                    chunk_data_a.depth, chunk_data_a.intrinsics, chunk_data_a.extrinsics
+                )
             point_map_a = point_map_a[chunk_a_rela_begin:chunk_a_rela_end]
             conf_a = chunk_data_a.conf[chunk_a_rela_begin:chunk_a_rela_end]
 
@@ -471,9 +477,12 @@ class Any_Streaming:
                 allow_pickle=True,
             ).item()
 
-            point_map_b = depth_to_point_cloud_vectorized(
-                chunk_data_b.depth, chunk_data_b.intrinsics, chunk_data_b.extrinsics
-            )
+            if getattr(chunk_data_b, 'world_points', None) is not None:
+                point_map_b = chunk_data_b.world_points
+            else:
+                point_map_b = depth_to_point_cloud_vectorized(
+                    chunk_data_b.depth, chunk_data_b.intrinsics, chunk_data_b.extrinsics
+                )
             point_map_b = point_map_b[chunk_b_rela_begin:chunk_b_rela_end]
             conf_b = chunk_data_b.conf[chunk_b_rela_begin:chunk_b_rela_end]
 
@@ -580,12 +589,18 @@ class Any_Streaming:
                 chunk_data1 = pre_predictions
                 chunk_data2 = cur_predictions
 
-                point_map1 = depth_to_point_cloud_vectorized(
-                    chunk_data1.depth, chunk_data1.intrinsics, chunk_data1.extrinsics
-                )
-                point_map2 = depth_to_point_cloud_vectorized(
-                    chunk_data2.depth, chunk_data2.intrinsics, chunk_data2.extrinsics
-                )
+                if getattr(chunk_data1, 'world_points', None) is not None:
+                    point_map1 = chunk_data1.world_points
+                else:
+                    point_map1 = depth_to_point_cloud_vectorized(
+                        chunk_data1.depth, chunk_data1.intrinsics, chunk_data1.extrinsics
+                    )
+                if getattr(chunk_data2, 'world_points', None) is not None:
+                    point_map2 = chunk_data2.world_points
+                else:
+                    point_map2 = depth_to_point_cloud_vectorized(
+                        chunk_data2.depth, chunk_data2.intrinsics, chunk_data2.extrinsics
+                    )
 
                 point_map1 = point_map1[-self.overlap :]
                 point_map2 = point_map2[: self.overlap]
@@ -672,16 +687,20 @@ class Any_Streaming:
 
             aligned_chunk_data = {}
 
-            aligned_chunk_data["world_points"] = depth_to_point_cloud_optimized_torch(
-                chunk_data.depth, chunk_data.intrinsics, chunk_data.extrinsics
-            )
+            if getattr(chunk_data, 'world_points', None) is not None:
+                aligned_chunk_data["world_points"] = chunk_data.world_points
+                print('Using world points from MapAnything!')
+            else:
+                aligned_chunk_data["world_points"] = depth_to_point_cloud_optimized_torch(
+                    chunk_data.depth, chunk_data.intrinsics, chunk_data.extrinsics
+                )
             aligned_chunk_data["world_points"] = apply_sim3_direct_torch(
                 aligned_chunk_data["world_points"], s, R, t
             )
 
             aligned_chunk_data["conf"] = chunk_data.conf
             aligned_chunk_data["images"] = chunk_data.processed_images
-            aligned_chunk_data["mask"] = chunk_data.mask
+            aligned_chunk_data["mask"] = getattr(chunk_data, 'mask', None)
 
             aligned_path = os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx+1}.npy")
             np.save(aligned_path, aligned_chunk_data)
@@ -691,11 +710,14 @@ class Any_Streaming:
                     os.path.join(self.result_unaligned_dir, "chunk_0.npy"), allow_pickle=True
                 ).item()
                 np.save(os.path.join(self.result_aligned_dir, "chunk_0.npy"), chunk_data_first)
-                points_first = depth_to_point_cloud_vectorized(
-                    chunk_data_first.depth,
-                    chunk_data_first.intrinsics,
-                    chunk_data_first.extrinsics,
-                )
+                if getattr(chunk_data_first, 'world_points', None) is not None:
+                    points_first = chunk_data_first.world_points
+                else:
+                    points_first = depth_to_point_cloud_vectorized(
+                        chunk_data_first.depth,
+                        chunk_data_first.intrinsics,
+                        chunk_data_first.extrinsics,
+                    )
                 colors_first = chunk_data_first.processed_images
                 ply_path_first = os.path.join(self.pcd_dir, "0_pcd.ply")
 
@@ -712,7 +734,10 @@ class Any_Streaming:
                         sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
                     )
                 else:
-                    mask_first = chunk_data_first.mask
+                    mask_first = getattr(chunk_data_first, 'mask', None)
+                    if mask_first is None:
+                        raise ValueError("use_conf_filtering=False requires mask, but mask is None. Use DA3 with use_conf_filtering=True.")
+                    # Leaving it hacky for now; TODO - make code flexible for conf-filtering (DA3 & MA) and masking (MA only).
                     save_masked_pointcloud_batch(
                         points=points_first,
                         colors=colors_first,
@@ -741,7 +766,10 @@ class Any_Streaming:
                     sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
                 )
             else:
-                mask = aligned_chunk_data["mask"].reshape(-1)
+                mask = aligned_chunk_data.get("mask", None)
+                if mask is None:
+                    raise ValueError("use_conf_filtering=False requires mask, but mask is None. Use DA3 with use_conf_filtering=True.")
+                mask = mask.reshape(-1)
                 save_masked_pointcloud_batch(
                     points=points,
                     colors=colors,
