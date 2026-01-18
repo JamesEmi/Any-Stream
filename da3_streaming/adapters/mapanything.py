@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from typing import List
 from .predictions import Predictions
+from mapanything.utils.geometry import depthmap_to_world_frame
 
 class MapAnythingAdapter:
     """
@@ -20,7 +21,7 @@ class MapAnythingAdapter:
         self.model = MapAnything.from_pretrained("facebook/map-anything-v1")
         self.model = self.model.to(self.device)
         self.model.eval()
-        print("MapAnything model - v1 loaded.")
+        print("MapAnything model loaded.")
 
     
     def infer(self, image_paths: List[str]) -> Predictions:
@@ -59,13 +60,22 @@ class MapAnythingAdapter:
             # Extract data from predictions
             depthmap_torch = pred["depth_z"][0].squeeze(-1)  # (H, W)
             depth = depthmap_torch.cpu().numpy()
-            conf = pred["conf"][0].cpu().numpy()  # Per-pixel confidence scores (H, W)
-            camera_pose_c2w = pred["camera_poses"][0].cpu().numpy()  # (4, 4)
+            camera_pose_c2w_torch = pred["camera_poses"][0]  # (4, 4)
             intrinsic_torch = pred["intrinsics"][0]  # (3, 3)
+
+            # Compute valid_mask from depth (same as demo_images_only_inference.py)
+            _, valid_mask = depthmap_to_world_frame(
+                depthmap_torch, intrinsic_torch, camera_pose_c2w_torch
+            )
+
+            camera_pose_c2w = camera_pose_c2w_torch.cpu().numpy()
             intrinsic = intrinsic_torch.cpu().numpy()
-            
-            img_no_norm = pred["img_no_norm"][0].cpu().numpy() # Denormalized input images for visualization (H, W, 3)
-            mask = pred["mask"][0].squeeze(-1).cpu().numpy()  # (H, W)
+
+            img_no_norm = pred["img_no_norm"][0].cpu().numpy() # (H, W, 3)
+            pred_mask = pred["mask"][0].squeeze(-1).cpu().numpy().astype(bool)  # (H, W)
+
+            # Combine prediction mask with valid depth mask
+            mask = pred_mask & valid_mask.cpu().numpy()
 
             # convert extrinsics from C2W to W2C
             camera_pose_w2c = np.linalg.inv(camera_pose_c2w) # (4, 4)
@@ -76,6 +86,9 @@ class MapAnythingAdapter:
             else:
                 img = img_no_norm.astype(np.uint8)
 
+            # Get confidence scores
+            conf = pred["conf"][0].cpu().numpy()  # (H, W)
+
             depths.append(depth)
             confs.append(conf)
             extrinsics.append(camera_pose_w2c)
@@ -84,10 +97,10 @@ class MapAnythingAdapter:
             masks.append(mask)
 
         return Predictions(
-        depth=np.stack(depths),           # (N, H, W)
-        conf=np.stack(confs),             # (N, H, W)
-        extrinsics=np.stack(extrinsics),  # (N, 3, 4)
-        intrinsics=np.stack(intrinsics),  # (N, 3, 3)
-        processed_images=np.stack(images_out),  # (N, H, W, 3)
-        mask=np.stack(masks),             # (N, H, W)
-    )
+            depth=np.stack(depths),           # (N, H, W)
+            conf=np.stack(confs),             # (N, H, W)
+            extrinsics=np.stack(extrinsics),  # (N, 3, 4)
+            intrinsics=np.stack(intrinsics),  # (N, 3, 3)
+            processed_images=np.stack(images_out),  # (N, H, W, 3)
+            mask=np.stack(masks),             # (N, H, W) bool
+        )

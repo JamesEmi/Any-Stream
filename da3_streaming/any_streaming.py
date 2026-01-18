@@ -41,6 +41,7 @@ from loop_utils.sim3utils import (
     precompute_scale_chunks_with_depth,
     process_loop_list,
     save_confident_pointcloud_batch,
+    save_masked_pointcloud_batch,
     warmup_numba,
     weighted_align_point_maps,
 )
@@ -680,6 +681,7 @@ class Any_Streaming:
 
             aligned_chunk_data["conf"] = chunk_data.conf
             aligned_chunk_data["images"] = chunk_data.processed_images
+            aligned_chunk_data["mask"] = chunk_data.mask
 
             aligned_path = os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx+1}.npy")
             np.save(aligned_path, aligned_chunk_data)
@@ -695,34 +697,58 @@ class Any_Streaming:
                     chunk_data_first.extrinsics,
                 )
                 colors_first = chunk_data_first.processed_images
-                confs_first = chunk_data_first.conf
                 ply_path_first = os.path.join(self.pcd_dir, "0_pcd.ply")
-                save_confident_pointcloud_batch(
-                    points=points_first,  # shape: (H, W, 3)
-                    colors=colors_first,  # shape: (H, W, 3)
-                    confs=confs_first,  # shape: (H, W)
-                    output_path=ply_path_first,
-                    conf_threshold=np.mean(confs_first)
-                    * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
-                    sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
-                )
+
+                use_conf = self.config["Model"]["Pointcloud_Save"].get("use_conf_filtering", True)
+                if use_conf:
+                    confs_first = chunk_data_first.conf
+                    save_confident_pointcloud_batch(
+                        points=points_first,
+                        colors=colors_first,
+                        confs=confs_first,
+                        output_path=ply_path_first,
+                        conf_threshold=np.mean(confs_first)
+                        * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
+                        sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+                    )
+                else:
+                    mask_first = chunk_data_first.mask
+                    save_masked_pointcloud_batch(
+                        points=points_first,
+                        colors=colors_first,
+                        mask=mask_first,
+                        output_path=ply_path_first,
+                        sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+                    )
                 if self.config["Model"]["save_depth_conf_result"]:
                     predictions = chunk_data_first
                     self.save_depth_conf_result(predictions, 0, 1, np.eye(3), np.array([0, 0, 0]))
 
             points = aligned_chunk_data["world_points"].reshape(-1, 3)
             colors = (aligned_chunk_data["images"].reshape(-1, 3)).astype(np.uint8)
-            confs = aligned_chunk_data["conf"].reshape(-1)
             ply_path = os.path.join(self.pcd_dir, f"{chunk_idx+1}_pcd.ply")
-            save_confident_pointcloud_batch(
-                points=points,  # shape: (H, W, 3)
-                colors=colors,  # shape: (H, W, 3)
-                confs=confs,  # shape: (H, W)
-                output_path=ply_path,
-                conf_threshold=np.mean(confs)
-                * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
-                sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
-            )
+
+            use_conf = self.config["Model"]["Pointcloud_Save"].get("use_conf_filtering", True)
+            if use_conf:
+                confs = aligned_chunk_data["conf"].reshape(-1)
+                save_confident_pointcloud_batch(
+                    points=points,
+                    colors=colors,
+                    confs=confs,
+                    output_path=ply_path,
+                    conf_threshold=np.mean(confs)
+                    * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
+                    sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+                )
+            else:
+                mask = aligned_chunk_data["mask"].reshape(-1)
+                save_masked_pointcloud_batch(
+                    points=points,
+                    colors=colors,
+                    mask=mask,
+                    output_path=ply_path,
+                    sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+                )
 
             if self.config["Model"]["save_depth_conf_result"]:
                 predictions = chunk_data

@@ -24,3 +24,4 @@ class Predictions:
     intrinsics: np.ndarray
     processed_images: np.ndarray
     mask: Optional[np.ndarray] = None
+    world_points: Optional[np.ndarray] = None  # (N, H, W, 3) pre-computed world points

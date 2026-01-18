@@ -321,7 +321,92 @@ def save_confident_pointcloud_batch(
 
         save_ply(reservoir_pts, reservoir_clr, output_path)
 
+def save_masked_pointcloud_batch(
+    points, colors, mask, output_path, sample_ratio=1.0, batch_size=1000000
+):
+    """
+    Save point cloud using boolean mask filtering (for MapAnything).
 
+    Args:
+    - points: np.ndarray,  (b, H, W, 3) / (N, 3)
+    - colors: np.ndarray,  (b, H, W, 3) / (N, 3)
+    - mask: np.ndarray,  (b, H, W) / (N,) boolean mask
+    - output_path: str
+    - sample_ratio: float (0 < sample_ratio <= 1.0)
+    - batch_size: int
+    """
+    if points.ndim == 2:
+        b = 1
+        points = points[np.newaxis, ...]
+        colors = colors[np.newaxis, ...]
+        mask = mask[np.newaxis, ...]
+    elif points.ndim == 4:
+        b = points.shape[0]
+    else:
+        raise ValueError("Unsupported points dimension. Must be 2 (N,3) or 4 (b,H,W,3)")
+
+    total_valid = 0
+    for i in range(b):
+        m = mask[i].reshape(-1).astype(bool)
+        total_valid += np.count_nonzero(m)
+
+    num_samples = int(total_valid * sample_ratio) if sample_ratio < 1.0 else total_valid
+
+    if num_samples == 0:
+        save_ply(np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8), output_path)
+        return
+
+    if sample_ratio == 1.0:
+        with open(output_path, "wb") as f:
+            write_ply_header(f, num_samples)
+
+            for i in range(b):
+                pts = points[i].reshape(-1, 3).astype(np.float32)
+                cls = colors[i].reshape(-1, 3).astype(np.uint8)
+                m = mask[i].reshape(-1).astype(bool)
+
+                valid_pts = pts[m]
+                valid_cls = cls[m]
+
+                for j in range(0, len(valid_pts), batch_size):
+                    batch_pts = valid_pts[j : j + batch_size]
+                    batch_cls = valid_cls[j : j + batch_size]
+                    write_ply_batch(f, batch_pts, batch_cls)
+
+    else:
+        reservoir_pts = np.zeros((num_samples, 3), dtype=np.float32)
+        reservoir_clr = np.zeros((num_samples, 3), dtype=np.uint8)
+        count = 0
+
+        for i in range(b):
+            pts = points[i].reshape(-1, 3).astype(np.float32)
+            cls = colors[i].reshape(-1, 3).astype(np.uint8)
+            m = mask[i].reshape(-1).astype(bool)
+
+            valid_pts = pts[m]
+            valid_cls = cls[m]
+            n_valid = len(valid_pts)
+
+            if count < num_samples:
+                fill_count = min(num_samples - count, n_valid)
+
+                reservoir_pts[count : count + fill_count] = valid_pts[:fill_count]
+                reservoir_clr[count : count + fill_count] = valid_cls[:fill_count]
+                count += fill_count
+
+                if fill_count < n_valid:
+                    remaining_pts = valid_pts[fill_count:]
+                    remaining_cls = valid_cls[fill_count:]
+
+                    count, reservoir_pts, reservoir_clr = optimized_vectorized_reservoir_sampling(
+                        remaining_pts, remaining_cls, count, reservoir_pts, reservoir_clr
+                    )
+            else:
+                count, reservoir_pts, reservoir_clr = optimized_vectorized_reservoir_sampling(
+                    valid_pts, valid_cls, count, reservoir_pts, reservoir_clr
+                )
+
+        save_ply(reservoir_pts, reservoir_clr, output_path)
 """ The following function is deprecated"""
 
 # def vectorized_reservoir_sampling(new_pts, new_cls, current_count, reservoir_pts, reservoir_clr):

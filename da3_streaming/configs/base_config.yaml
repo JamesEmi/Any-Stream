@@ -1,5 +1,5 @@
 Weights:
-  model: 'MapAnything' # DA3 or MapAnything
+  model: 'DA3' # DA3 or MapAnything
   DA3: './weights/model.safetensors'
   DA3_CONFIG: './weights/config.json'
   SALAD: './weights/dino_salad.ckpt'
@@ -34,7 +34,8 @@ Model:
 
   Pointcloud_Save:
     sample_ratio: 0.015
-    conf_threshold_coef: 0.75 # conf_threshold = np.mean(confs) * conf_threshold_coef
+    conf_threshold_coef: -1.0 # conf_threshold = np.mean(confs) * conf_threshold_coef
+    use_conf_filtering: False # If False, use mask-based filtering (for MapAnything)
 
 Loop:
   SALAD:
