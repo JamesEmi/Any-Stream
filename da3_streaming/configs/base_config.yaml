@@ -10,7 +10,7 @@ Model:
   loop_chunk_size: 20 # imgs of loop chunk = 2 * loop_chunk_size
   loop_enable: True
   useDBoW: False
-  delete_temp_files: True
+  delete_temp_files: False
   align_lib: 'triton' # choose among 'triton' (GPU), 'torch' (GPU), 'numba' (CPU) or 'numpy' (CPU)
   align_method: 'sim3' # choose among 'sim3', 'se3' or 'scale+se3'
   scale_compute_method: 'auto' # choose among 'auto', 'ransac' or 'weighted'. It is used when align_method == 'scale+se3'

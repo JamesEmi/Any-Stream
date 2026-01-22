@@ -18,7 +18,7 @@ class MapAnythingAdapter:
         """Load MapAnything model."""
         from mapanything.models import MapAnything
         
-        self.model = MapAnything.from_pretrained("facebook/map-anything-v1")
+        self.model = MapAnything.from_pretrained("facebook/map-anything")
         self.model = self.model.to(self.device)
         self.model.eval()
         print("MapAnything model loaded.")
@@ -89,6 +89,7 @@ class MapAnythingAdapter:
 
             # Get confidence scores
             conf = pred["conf"][0].cpu().numpy()  # (H, W)
+            conf = (conf - conf.min()) / (conf.max() - conf.min()) * 100.0
 
             depths.append(depth)
             confs.append(conf)
@@ -105,4 +106,5 @@ class MapAnythingAdapter:
             intrinsics=np.stack(intrinsics),  # (N, 3, 3)
             processed_images=np.stack(images_out),  # (N, H, W, 3)
             mask=np.stack(masks),             # (N, H, W) bool
+            world_points=np.stack(world_points_list),  # (N, H, W, 3)
         )
