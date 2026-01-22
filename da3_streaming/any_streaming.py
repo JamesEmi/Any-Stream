@@ -296,6 +296,7 @@ class Any_Streaming:
                         ref_view_strategy=ref_view_strategy
                     )
                     predictions.depth = np.squeeze(predictions.depth)
+                    # import ipdb; ipdb.set_trace()
                     predictions.conf -= 1.0 # Conf correction for DA3
 
             elif self.model_type == "MapAnything":
@@ -312,7 +313,8 @@ class Any_Streaming:
         print(f"predictions.conf.shape: {predictions.conf.shape}")  # [N, H, W]
         print(f"predictions.extrinsics.shape: {predictions.extrinsics.shape}")  # [N, 3, 4]
         print(f"predictions.intrinsics.shape: {predictions.intrinsics.shape}")  # [N, 3, 3]
-
+        mean_depth = np.mean(predictions.depth)
+        print(f'Mean depth for this chunk inference: {mean_depth}')
         # Save predictions to disk instead of keeping in memory
         if is_loop:
             save_dir = self.result_loop_dir
@@ -721,8 +723,17 @@ class Any_Streaming:
                 colors_first = chunk_data_first.processed_images
                 ply_path_first = os.path.join(self.pcd_dir, "0_pcd.ply")
 
-                use_conf = self.config["Model"]["Pointcloud_Save"].get("use_conf_filtering", True)
-                if use_conf:
+                # Auto-detect: use mask-based saving if mask exists (MapAnything), else conf-based (DA3)
+                mask_first = getattr(chunk_data_first, 'mask', None)
+                if mask_first is not None:
+                    save_masked_pointcloud_batch(
+                        points=points_first,
+                        colors=colors_first,
+                        mask=mask_first,
+                        output_path=ply_path_first,
+                        sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+                    )
+                else:
                     confs_first = chunk_data_first.conf
                     save_confident_pointcloud_batch(
                         points=points_first,
@@ -733,18 +744,6 @@ class Any_Streaming:
                         * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
                         sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
                     )
-                else:
-                    mask_first = getattr(chunk_data_first, 'mask', None)
-                    if mask_first is None:
-                        raise ValueError("use_conf_filtering=False requires mask, but mask is None. Use DA3 with use_conf_filtering=True.")
-                    # Leaving it hacky for now; TODO - make code flexible for conf-filtering (DA3 & MA) and masking (MA only).
-                    save_masked_pointcloud_batch(
-                        points=points_first,
-                        colors=colors_first,
-                        mask=mask_first,
-                        output_path=ply_path_first,
-                        sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
-                    )
                 if self.config["Model"]["save_depth_conf_result"]:
                     predictions = chunk_data_first
                     self.save_depth_conf_result(predictions, 0, 1, np.eye(3), np.array([0, 0, 0]))
@@ -753,8 +752,17 @@ class Any_Streaming:
             colors = (aligned_chunk_data["images"].reshape(-1, 3)).astype(np.uint8)
             ply_path = os.path.join(self.pcd_dir, f"{chunk_idx+1}_pcd.ply")
 
-            use_conf = self.config["Model"]["Pointcloud_Save"].get("use_conf_filtering", True)
-            if use_conf:
+            # Auto-detect: use mask-based saving if mask exists (MapAnything), else conf-based (DA3)
+            mask = aligned_chunk_data.get("mask", None)
+            if mask is not None:
+                save_masked_pointcloud_batch(
+                    points=points,
+                    colors=colors,
+                    mask=mask.reshape(-1),
+                    output_path=ply_path,
+                    sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+                )
+            else:
                 confs = aligned_chunk_data["conf"].reshape(-1)
                 save_confident_pointcloud_batch(
                     points=points,
@@ -763,18 +771,6 @@ class Any_Streaming:
                     output_path=ply_path,
                     conf_threshold=np.mean(confs)
                     * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
-                    sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
-                )
-            else:
-                mask = aligned_chunk_data.get("mask", None)
-                if mask is None:
-                    raise ValueError("use_conf_filtering=False requires mask, but mask is None. Use DA3 with use_conf_filtering=True.")
-                mask = mask.reshape(-1)
-                save_masked_pointcloud_batch(
-                    points=points,
-                    colors=colors,
-                    mask=mask,
-                    output_path=ply_path,
                     sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
                 )
 
