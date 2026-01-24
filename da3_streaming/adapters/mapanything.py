@@ -43,7 +43,10 @@ class MapAnythingAdapter:
         # 2. Run inference
         with torch.no_grad():
             outputs = self.model.infer(views,
-                                    # apply_mask=True, # Apply masking to dense geometry outputs
+                                    #    use_multiview_confidence=True,
+                                    #    confidence_percentile=10,
+                                    #    apply_confidence_mask=True,
+                                    # # apply_mask=True, # Apply masking to dense geometry outputs
                                     # mask_edges=True, 
                                 )
 
@@ -89,8 +92,8 @@ class MapAnythingAdapter:
 
             # Get confidence scores
             conf = pred["conf"][0].cpu().numpy()  # (H, W)
-            conf = (conf - conf.min()) / (conf.max() - conf.min()) * 100.0
-
+            # conf = (conf - conf.min()) / (conf.max() - conf.min()) * 100.0 #TODO: Implement cross view confidence.
+            
             depths.append(depth)
             confs.append(conf)
             extrinsics.append(camera_pose_w2c)
@@ -98,10 +101,25 @@ class MapAnythingAdapter:
             images_out.append(img)
             masks.append(mask)
             world_points_list.append(pts3d_computed.cpu().numpy())  # (H, W, 3)
+        
+         # Stack arrays
+        conf_array = np.stack(confs)    # (N, H, W)
+        mask_array = np.stack(masks)    # (N, H, W)
+
+        # Normalize confidence across all views to 0-100 range
+        conf_min, conf_max = conf_array.min(), conf_array.max()
+        if conf_max > conf_min:
+            conf_array = (conf_array - conf_min) / (conf_max - conf_min) * 100.0
+        else:
+            conf_array = np.full_like(conf_array, 50.0)
+
+        # Set confidence to zero for invalid mask regions
+        conf_array[~mask_array] = 0.0
+
 
         return Predictions(
             depth=np.stack(depths),           # (N, H, W)
-            conf=np.stack(confs),             # (N, H, W)
+            conf=conf_array,             # (N, H, W)
             extrinsics=np.stack(extrinsics),  # (N, 3, 4)
             intrinsics=np.stack(intrinsics),  # (N, 3, 3)
             processed_images=np.stack(images_out),  # (N, H, W, 3)
