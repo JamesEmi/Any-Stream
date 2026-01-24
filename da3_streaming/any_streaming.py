@@ -184,6 +184,11 @@ class Any_Streaming:
             self.model = MapAnythingAdapter(device=self.device)
             self.model.load()
 
+        elif model_type == "Pi3":
+            from adapters.pi3 import Pi3Adapter
+            self.model = Pi3Adapter(device=self.device)
+            self.model.load()
+
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -248,7 +253,7 @@ class Any_Streaming:
             image = predictions.processed_images[local_idx]  # [H, W, 3] uint8
             depth = predictions.depth[local_idx]  # [H, W] float32
             conf = predictions.conf[local_idx]  # [H, W] float32
-            intrinsics = predictions.intrinsics[local_idx]  # [3, 3] float32
+            intrinsics = predictions.intrinsics[local_idx] if predictions.intrinsics is not None else None  # [3, 3] float32
 
             filename = f"frame_{global_idx}.npz"
             filepath = os.path.join(self.result_output_dir, filename)
@@ -296,10 +301,12 @@ class Any_Streaming:
                         ref_view_strategy=ref_view_strategy
                     )
                     predictions.depth = np.squeeze(predictions.depth)
-                    # import ipdb; ipdb.set_trace()
                     predictions.conf -= 1.0 # Conf correction for DA3
 
             elif self.model_type == "MapAnything":
+                predictions = self.model.infer(chunk_image_paths)
+
+            elif self.model_type == "Pi3":
                 predictions = self.model.infer(chunk_image_paths)
 
         infer_time = time.time() - t_infer
@@ -312,9 +319,12 @@ class Any_Streaming:
         print(f"predictions.depth.shape: {predictions.depth.shape}")  # [N, H, W]
         print(f"predictions.conf.shape: {predictions.conf.shape}")  # [N, H, W]
         print(f"predictions.extrinsics.shape: {predictions.extrinsics.shape}")  # [N, 3, 4]
-        print(f"predictions.intrinsics.shape: {predictions.intrinsics.shape}")  # [N, 3, 3]
+        if predictions.intrinsics is not None:
+            print(f"predictions.intrinsics.shape: {predictions.intrinsics.shape}")  # [N, 3, 3]
+        else:
+            print("predictions.intrinsics: None (using world_points directly)")
         mean_depth = np.mean(predictions.depth)
-        print(f'Mean depth for this chunk inference: {mean_depth}')
+        print(f'Mean depth for this chunk inference (DA3): {mean_depth}')
         # Save predictions to disk instead of keeping in memory
         if is_loop:
             save_dir = self.result_loop_dir
@@ -821,6 +831,7 @@ class Any_Streaming:
 
         first_chunk_range, first_chunk_extrinsics = self.all_camera_poses[0]
         _, first_chunk_intrinsics = self.all_camera_intrinsics[0]
+        has_intrinsics = first_chunk_intrinsics is not None
 
         for i, idx in enumerate(
             range(first_chunk_range[0], first_chunk_range[1] - self.overlap_e)
@@ -829,7 +840,8 @@ class Any_Streaming:
             w2c[:3, :] = first_chunk_extrinsics[i]
             c2w = np.linalg.inv(w2c)
             all_poses[idx] = c2w
-            all_intrinsics[idx] = first_chunk_intrinsics[i]
+            if has_intrinsics:
+                all_intrinsics[idx] = first_chunk_intrinsics[i]
 
         for chunk_idx in range(1, len(self.all_camera_poses)):
             chunk_range, chunk_extrinsics = self.all_camera_poses[chunk_idx]
@@ -857,7 +869,8 @@ class Any_Streaming:
                 transformed_c2w[:3, :3] /= s  # Normalize rotation
 
                 all_poses[idx] = transformed_c2w
-                all_intrinsics[idx] = chunk_intrinsics[i + self.overlap_s]
+                if has_intrinsics:
+                    all_intrinsics[idx] = chunk_intrinsics[i + self.overlap_s]
 
         poses_path = os.path.join(self.output_dir, "camera_poses.txt")
         with open(poses_path, "w") as f:
@@ -867,16 +880,19 @@ class Any_Streaming:
 
         print(f"Camera poses saved to {poses_path}")
 
-        intrinsics_path = os.path.join(self.output_dir, "intrinsic.txt")
-        with open(intrinsics_path, "w") as f:
-            for intrinsic in all_intrinsics:
-                fx = intrinsic[0, 0]
-                fy = intrinsic[1, 1]
-                cx = intrinsic[0, 2]
-                cy = intrinsic[1, 2]
-                f.write(f"{fx} {fy} {cx} {cy}\n")
-
-        print(f"Camera intrinsics saved to {intrinsics_path}")
+        # Save intrinsics if available (Pi3 doesn't output intrinsics, uses world_points directly)
+        if has_intrinsics:
+            intrinsics_path = os.path.join(self.output_dir, "intrinsic.txt")
+            with open(intrinsics_path, "w") as f:
+                for intrinsic in all_intrinsics:
+                    fx = intrinsic[0, 0]
+                    fy = intrinsic[1, 1]
+                    cx = intrinsic[0, 2]
+                    cy = intrinsic[1, 2]
+                    f.write(f"{fx} {fy} {cx} {cy}\n")
+            print(f"Camera intrinsics saved to {intrinsics_path}")
+        else:
+            print("Intrinsics not available (model uses world_points directly)")
 
         ply_path = os.path.join(self.output_dir, "camera_poses.ply")
         with open(ply_path, "w") as f:
