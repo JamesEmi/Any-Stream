@@ -200,6 +200,10 @@ class Any_Streaming:
         with open(self.log_file, "w") as f:
             f.write(f"model_load: {load_time:.2f}s\n")
 
+        self.total_infer_time = 0.0
+        self.total_align_time = 0.0
+        self.start_time = time.time()
+
         self.skyseg_session = None
 
         self.chunk_indices = None  # [(begin_idx, end_idx), ...]
@@ -310,6 +314,7 @@ class Any_Streaming:
                 predictions = self.model.infer(chunk_image_paths)
 
         infer_time = time.time() - t_infer
+        self.total_infer_time += infer_time
         print(f"Inference time: {infer_time:.2f}s")
         with open(self.log_file, "a") as f:
             f.write(f"chunk_{chunk_idx}_infer: {infer_time:.2f}s\n")
@@ -642,6 +647,7 @@ class Any_Streaming:
                     chunk2_depth_conf,
                 )
                 align_time = time.time() - t_align
+                self.total_align_time += align_time
                 print(f"Alignment time: {align_time:.2f}s")
                 with open(self.log_file, "a") as f:
                     f.write(f"chunk_{chunk_idx-1}_to_{chunk_idx}_align: {align_time:.2f}s\n")
@@ -791,6 +797,24 @@ class Any_Streaming:
 
         self.save_camera_poses()
 
+        # Write timing summary
+        total_time = time.time() - self.start_time
+        with open(self.log_file, "a") as f:
+            f.write("\n--- SUMMARY ---\n")
+            f.write(f"total_infer_time: {self.total_infer_time:.2f}s\n")
+            f.write(f"total_align_time: {self.total_align_time:.2f}s\n")
+            f.write(f"total_wall_time: {total_time:.2f}s\n")
+            f.write(f"num_images: {len(self.img_list)}\n")
+            f.write(f"num_chunks: {len(self.chunk_indices)}\n")
+            f.write(f"avg_infer_per_chunk: {self.total_infer_time / len(self.chunk_indices):.2f}s\n")
+            f.write(f"avg_infer_per_image: {self.total_infer_time / len(self.img_list):.2f}s\n")
+
+        print(f"\n=== Timing Summary ===")
+        print(f"Total inference time: {self.total_infer_time:.2f}s")
+        print(f"Total alignment time: {self.total_align_time:.2f}s")
+        print(f"Total wall time: {total_time:.2f}s")
+        print(f"Avg inference per image: {self.total_infer_time / len(self.img_list):.2f}s")
+
         print("Done.")
 
     def run(self):
@@ -813,7 +837,7 @@ class Any_Streaming:
         - ply file: Camera poses visualized as points with different colors for each chunk
         """
         chunk_colors = [
-            [255, 0, 0],  # Red
+            [255, 0, 0],  # Red 
             [0, 255, 0],  # Green
             [0, 0, 255],  # Blue
             [255, 255, 0],  # Yellow
