@@ -200,6 +200,10 @@ class Any_Streaming:
         with open(self.log_file, "w") as f:
             f.write(f"model_load: {load_time:.2f}s\n")
 
+        self.total_infer_time = 0.0
+        self.total_align_time = 0.0
+        self.start_time = time.time()
+
         self.skyseg_session = None
 
         self.chunk_indices = None  # [(begin_idx, end_idx), ...]
@@ -276,7 +280,7 @@ class Any_Streaming:
                 )
         print("")
 
-    def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False):
+    def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False, prior_predictions=None):
         start_idx, end_idx = range_1
         chunk_image_paths = self.img_list[start_idx:end_idx]
         if range_2 is not None:
@@ -301,15 +305,25 @@ class Any_Streaming:
                         ref_view_strategy=ref_view_strategy
                     )
                     predictions.depth = np.squeeze(predictions.depth)
+                    import ipdb; ipdb.set_trace()
                     predictions.conf -= 1.0 # Conf correction for DA3
 
             elif self.model_type == "MapAnything":
-                predictions = self.model.infer(chunk_image_paths)
+                use_sliding_prior = self.config["Model"].get("sliding_prior", False)
+                if use_sliding_prior and not is_loop and chunk_idx > 0 and prior_predictions is not None:
+                    predictions = self.model.infer(
+                        chunk_image_paths,
+                        prior_predictions=prior_predictions,
+                        overlap_count=self.overlap,
+                    )
+                else:
+                    predictions = self.model.infer(chunk_image_paths)
 
             elif self.model_type == "Pi3":
                 predictions = self.model.infer(chunk_image_paths)
 
         infer_time = time.time() - t_infer
+        self.total_infer_time += infer_time
         print(f"Inference time: {infer_time:.2f}s")
         with open(self.log_file, "a") as f:
             f.write(f"chunk_{chunk_idx}_infer: {infer_time:.2f}s\n")
@@ -590,62 +604,74 @@ class Any_Streaming:
         for chunk_idx in range(len(self.chunk_indices)):
             print(f"[Progress]: {chunk_idx}/{len(self.chunk_indices)}")
             cur_predictions = self.process_single_chunk(
-                self.chunk_indices[chunk_idx], chunk_idx=chunk_idx
+                self.chunk_indices[chunk_idx], chunk_idx=chunk_idx, prior_predictions=pre_predictions
             )
             torch.cuda.empty_cache()
 
+            # Check if we should skip post-hoc alignment (for conditioned MapAnything inference)
+            skip_alignment = (
+                self.model_type == "MapAnything"
+                and self.config["Model"].get("skip_post_hoc_alignment", False)
+            )
+
             if chunk_idx > 0:
-                print(
-                    f"Aligning {chunk_idx-1} and {chunk_idx} (Total {len(self.chunk_indices)-1})"
-                )
-                chunk_data1 = pre_predictions
-                chunk_data2 = cur_predictions
-
-                if getattr(chunk_data1, 'world_points', None) is not None:
-                    point_map1 = chunk_data1.world_points
+                if skip_alignment:
+                    # Chunks already aligned via conditioned inference - use identity transform
+                    print(f"Skipping alignment {chunk_idx-1} -> {chunk_idx} (conditioned inference)")
+                    self.sim3_list.append((1.0, np.eye(3), np.zeros(3)))
                 else:
-                    point_map1 = depth_to_point_cloud_vectorized(
-                        chunk_data1.depth, chunk_data1.intrinsics, chunk_data1.extrinsics
+                    print(
+                        f"Aligning {chunk_idx-1} and {chunk_idx} (Total {len(self.chunk_indices)-1})"
                     )
-                if getattr(chunk_data2, 'world_points', None) is not None:
-                    point_map2 = chunk_data2.world_points
-                else:
-                    point_map2 = depth_to_point_cloud_vectorized(
-                        chunk_data2.depth, chunk_data2.intrinsics, chunk_data2.extrinsics
+                    chunk_data1 = pre_predictions
+                    chunk_data2 = cur_predictions
+
+                    if getattr(chunk_data1, 'world_points', None) is not None:
+                        point_map1 = chunk_data1.world_points
+                    else:
+                        point_map1 = depth_to_point_cloud_vectorized(
+                            chunk_data1.depth, chunk_data1.intrinsics, chunk_data1.extrinsics
+                        )
+                    if getattr(chunk_data2, 'world_points', None) is not None:
+                        point_map2 = chunk_data2.world_points
+                    else:
+                        point_map2 = depth_to_point_cloud_vectorized(
+                            chunk_data2.depth, chunk_data2.intrinsics, chunk_data2.extrinsics
+                        )
+
+                    point_map1 = point_map1[-self.overlap :]
+                    point_map2 = point_map2[: self.overlap]
+                    conf1 = chunk_data1.conf[-self.overlap :]
+                    conf2 = chunk_data2.conf[: self.overlap]
+
+                    if self.config["Model"]["align_method"] == "scale+se3":
+                        chunk1_depth = np.squeeze(chunk_data1.depth[-self.overlap :])
+                        chunk2_depth = np.squeeze(chunk_data2.depth[: self.overlap])
+                        chunk1_depth_conf = np.squeeze(chunk_data1.conf[-self.overlap :])
+                        chunk2_depth_conf = np.squeeze(chunk_data2.conf[: self.overlap])
+                    else:
+                        chunk1_depth = None
+                        chunk2_depth = None
+                        chunk1_depth_conf = None
+                        chunk2_depth_conf = None
+
+                    t_align = time.time()
+                    s, R, t = self.align_2pcds(
+                        point_map1,
+                        conf1,
+                        point_map2,
+                        conf2,
+                        chunk1_depth,
+                        chunk2_depth,
+                        chunk1_depth_conf,
+                        chunk2_depth_conf,
                     )
-
-                point_map1 = point_map1[-self.overlap :]
-                point_map2 = point_map2[: self.overlap]
-                conf1 = chunk_data1.conf[-self.overlap :]
-                conf2 = chunk_data2.conf[: self.overlap]
-
-                if self.config["Model"]["align_method"] == "scale+se3":
-                    chunk1_depth = np.squeeze(chunk_data1.depth[-self.overlap :])
-                    chunk2_depth = np.squeeze(chunk_data2.depth[: self.overlap])
-                    chunk1_depth_conf = np.squeeze(chunk_data1.conf[-self.overlap :])
-                    chunk2_depth_conf = np.squeeze(chunk_data2.conf[: self.overlap])
-                else:
-                    chunk1_depth = None
-                    chunk2_depth = None
-                    chunk1_depth_conf = None
-                    chunk2_depth_conf = None
-
-                t_align = time.time()
-                s, R, t = self.align_2pcds(
-                    point_map1,
-                    conf1,
-                    point_map2,
-                    conf2,
-                    chunk1_depth,
-                    chunk2_depth,
-                    chunk1_depth_conf,
-                    chunk2_depth_conf,
-                )
-                align_time = time.time() - t_align
-                print(f"Alignment time: {align_time:.2f}s")
-                with open(self.log_file, "a") as f:
-                    f.write(f"chunk_{chunk_idx-1}_to_{chunk_idx}_align: {align_time:.2f}s\n")
-                self.sim3_list.append((s, R, t))
+                    align_time = time.time() - t_align
+                    self.total_align_time += align_time
+                    print(f"Alignment time: {align_time:.2f}s")
+                    with open(self.log_file, "a") as f:
+                        f.write(f"chunk_{chunk_idx-1}_to_{chunk_idx}_align: {align_time:.2f}s\n")
+                    self.sim3_list.append((s, R, t))
 
             pre_predictions = cur_predictions
 
@@ -791,6 +817,24 @@ class Any_Streaming:
 
         self.save_camera_poses()
 
+        # Write timing summary
+        total_time = time.time() - self.start_time
+        with open(self.log_file, "a") as f:
+            f.write("\n--- SUMMARY ---\n")
+            f.write(f"total_infer_time: {self.total_infer_time:.2f}s\n")
+            f.write(f"total_align_time: {self.total_align_time:.2f}s\n")
+            f.write(f"total_wall_time: {total_time:.2f}s\n")
+            f.write(f"num_images: {len(self.img_list)}\n")
+            f.write(f"num_chunks: {len(self.chunk_indices)}\n")
+            f.write(f"avg_infer_per_chunk: {self.total_infer_time / len(self.chunk_indices):.2f}s\n")
+            f.write(f"avg_infer_per_image: {self.total_infer_time / len(self.img_list):.2f}s\n")
+
+        print(f"\n=== Timing Summary ===")
+        print(f"Total inference time: {self.total_infer_time:.2f}s")
+        print(f"Total alignment time: {self.total_align_time:.2f}s")
+        print(f"Total wall time: {total_time:.2f}s")
+        print(f"Avg inference per image: {self.total_infer_time / len(self.img_list):.2f}s")
+
         print("Done.")
 
     def run(self):
@@ -813,7 +857,7 @@ class Any_Streaming:
         - ply file: Camera poses visualized as points with different colors for each chunk
         """
         chunk_colors = [
-            [255, 0, 0],  # Red
+            [255, 0, 0],  # Red 
             [0, 255, 0],  # Green
             [0, 0, 255],  # Blue
             [255, 255, 0],  # Yellow
