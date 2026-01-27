@@ -48,6 +48,7 @@ from loop_utils.sim3utils import (
 from safetensors.torch import load_file
 
 from depth_anything_3.api import DepthAnything3
+from rerun_logger import RerunLogger
 
 matplotlib.use("Agg")
 
@@ -227,6 +228,12 @@ class Any_Streaming:
             )
             self.loop_detector.load_model()
 
+        # Initialize Rerun logger
+        self.rerun_enabled = self.config["Model"].get("rerun_viz", False)
+        self.rerun_logger = RerunLogger(enabled=self.rerun_enabled, save_dir=self.output_dir)
+        if self.rerun_enabled:
+            self.rerun_logger.init(f"DA3_Streaming_{model_type}")
+
         print("init done.")
 
     def get_loop_pairs(self):
@@ -305,7 +312,7 @@ class Any_Streaming:
                         ref_view_strategy=ref_view_strategy
                     )
                     predictions.depth = np.squeeze(predictions.depth)
-                    import ipdb; ipdb.set_trace()
+                    # import ipdb; ipdb.set_trace()
                     predictions.conf -= 1.0 # Conf correction for DA3
 
             elif self.model_type == "MapAnything":
@@ -608,6 +615,22 @@ class Any_Streaming:
             )
             torch.cuda.empty_cache()
 
+            # Log chunk to Rerun
+            chunk_start, chunk_end = self.chunk_indices[chunk_idx]
+            if self.rerun_enabled and hasattr(cur_predictions, 'world_points'):
+                self.rerun_logger.log_chunk(
+                    chunk_idx=chunk_idx,
+                    world_points=cur_predictions.world_points,
+                    colors=cur_predictions.processed_images,
+                    masks=cur_predictions.mask,
+                    camera_poses_c2w=cur_predictions.camera_poses_c2w,
+                    intrinsics=cur_predictions.intrinsics,
+                    images=cur_predictions.processed_images,
+                    depths=cur_predictions.depth,
+                    chunk_start_idx=chunk_start,
+                    conf=cur_predictions.conf,
+                )
+
             # Check if we should skip post-hoc alignment (for conditioned MapAnything inference)
             skip_alignment = (
                 self.model_type == "MapAnything"
@@ -737,7 +760,7 @@ class Any_Streaming:
             )
 
             aligned_chunk_data["conf"] = chunk_data.conf
-            aligned_chunk_data["images"] = chunk_data.processed_images
+            aligned_chunk_data["processed_images"] = chunk_data.processed_images
             aligned_chunk_data["mask"] = getattr(chunk_data, 'mask', None)
 
             aligned_path = os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx+1}.npy")
@@ -785,7 +808,7 @@ class Any_Streaming:
                     self.save_depth_conf_result(predictions, 0, 1, np.eye(3), np.array([0, 0, 0]))
 
             points = aligned_chunk_data["world_points"].reshape(-1, 3)
-            colors = (aligned_chunk_data["images"].reshape(-1, 3)).astype(np.uint8)
+            colors = (aligned_chunk_data["processed_images"].reshape(-1, 3)).astype(np.uint8)
             ply_path = os.path.join(self.pcd_dir, f"{chunk_idx+1}_pcd.ply")
 
             # Auto-detect: use mask-based saving if mask exists (MapAnything), else conf-based (DA3)
@@ -814,8 +837,12 @@ class Any_Streaming:
                 predictions = chunk_data
                 predictions.depth *= s
                 self.save_depth_conf_result(predictions, chunk_idx + 1, s, R, t)
-
+        # import ipdb; ipdb.set_trace()
         self.save_camera_poses()
+
+        # Log final pointcloud and camera trajectory to Rerun
+        if self.rerun_enabled:
+            self._log_final_to_rerun()
 
         # Write timing summary
         total_time = time.time() - self.start_time
@@ -874,6 +901,7 @@ class Any_Streaming:
         all_intrinsics = [None] * len(self.img_list)
 
         first_chunk_range, first_chunk_extrinsics = self.all_camera_poses[0]
+        # import ipdb; ipdb.set_trace()
         _, first_chunk_intrinsics = self.all_camera_intrinsics[0]
         has_intrinsics = first_chunk_intrinsics is not None
 
@@ -960,6 +988,90 @@ class Any_Streaming:
                 )
 
         print(f"Camera poses visualization saved to {ply_path}")
+
+    def _log_final_to_rerun(self):
+        """
+        Log the final combined pointcloud and camera trajectory to Rerun.
+        Reads the aligned chunk files and combines them.
+        """
+        print("Logging final pointcloud and camera trajectory to Rerun...")
+
+        all_points = []
+        all_colors = []
+
+        # Load and combine all aligned chunks
+        for chunk_idx in range(len(self.chunk_indices)):
+            aligned_path = os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx}.npy")
+            if os.path.exists(aligned_path):
+                chunk_data = np.load(aligned_path, allow_pickle=True).item()
+
+                def get_val(obj, key):
+                    """Get value from dict or object."""
+                    if isinstance(obj, dict):
+                        return obj.get(key, None)
+                    return getattr(obj, key, None)
+
+                points = get_val(chunk_data, "world_points")
+                if points is not None:
+                    colors = get_val(chunk_data, "processed_images")
+                    mask = get_val(chunk_data, "mask")
+                    conf = get_val(chunk_data, "conf")
+
+                    # Reshape if needed
+                    if points.ndim == 4:
+                        points = points.reshape(-1, 3)
+                        colors = colors.reshape(-1, 3)
+                        if mask is not None:
+                            mask = mask.reshape(-1)
+                        if conf is not None:
+                            conf = conf.reshape(-1)
+
+                    # Filter by mask or confidence
+                    if mask is not None:
+                        valid = mask
+                    elif conf is not None:
+                        valid = conf > np.mean(conf) * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"]
+                    else:
+                        valid = np.ones(points.shape[0], dtype=bool)
+
+                    # Subsample for visualization (matching save ratio)
+                    sample_ratio = self.config["Model"]["Pointcloud_Save"]["sample_ratio"]
+                    if sample_ratio < 1.0:
+                        n_valid = valid.sum()
+                        n_sample = int(n_valid * sample_ratio)
+                        valid_indices = np.where(valid)[0]
+                        if len(valid_indices) > n_sample:
+                            sampled = np.random.choice(valid_indices, n_sample, replace=False)
+                            sample_mask = np.zeros_like(valid)
+                            sample_mask[sampled] = True
+                            valid = valid & sample_mask
+
+                    all_points.append(points[valid])
+                    all_colors.append(colors[valid].astype(np.uint8))
+
+        if all_points:
+            combined_points = np.concatenate(all_points, axis=0)
+            combined_colors = np.concatenate(all_colors, axis=0)
+
+            self.rerun_logger.log_final_pointcloud(
+                points=combined_points,
+                colors=combined_colors,
+                name="final_pointcloud",
+            )
+
+        # Log camera trajectory from saved poses
+        poses_path = os.path.join(self.output_dir, "camera_poses.txt")
+        if os.path.exists(poses_path):
+            all_poses = []
+            with open(poses_path, "r") as f:
+                for line in f:
+                    values = [float(x) for x in line.strip().split()]
+                    if len(values) == 16:
+                        pose = np.array(values).reshape(4, 4)
+                        all_poses.append(pose)
+
+            if all_poses:
+                self.rerun_logger.log_camera_trajectory(all_poses, name="camera_trajectory")
 
     def close(self):
         """
