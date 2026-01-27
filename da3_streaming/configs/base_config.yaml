@@ -5,10 +5,10 @@ Weights:
   SALAD: './weights/dino_salad.ckpt'
 
 Model:
-  chunk_size: 120
-  overlap: 60
+  chunk_size: 10
+  overlap: 0
   loop_chunk_size: 20 # imgs of loop chunk = 2 * loop_chunk_size
-  loop_enable: True
+  loop_enable: False
   useDBoW: False
   delete_temp_files: False
   align_lib: 'triton' # choose among 'triton' (GPU), 'torch' (GPU), 'numba' (CPU) or 'numpy' (CPU)
@@ -19,8 +19,9 @@ Model:
   ref_view_strategy: 'saddle_balanced' # 'middle', 'saddle_balanced', 'first' or 'saddle_sim_range'
   ref_view_strategy_loop: 'saddle_balanced' # 'middle', 'saddle_balanced', 'first' or 'saddle_sim_range'
   depth_threshold: 15.0
-  skip_post_hoc_alignment: False # Set True to skip SIM3 alignment when using conditioned MapAnything inference
+  skip_post_hoc_alignment: True # Set True to skip SIM3 alignment when using conditioned MapAnything inference
   sliding_prior: True
+  rerun_viz: True
 
   save_depth_conf_result: True
   save_debug_info: False
