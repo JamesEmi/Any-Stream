@@ -230,7 +230,7 @@ class Any_Streaming:
 
         # Initialize Rerun logger
         self.rerun_enabled = self.config["Model"].get("rerun_viz", False)
-        self.rerun_logger = RerunLogger(enabled=self.rerun_enabled, save_dir=self.output_dir)
+        self.rerun_logger = RerunLogger(enabled=self.rerun_enabled)
         if self.rerun_enabled:
             self.rerun_logger.init(f"DA3_Streaming_{model_type}")
 
@@ -312,7 +312,7 @@ class Any_Streaming:
                         ref_view_strategy=ref_view_strategy
                     )
                     predictions.depth = np.squeeze(predictions.depth)
-                    # import ipdb; ipdb.set_trace()
+                    import ipdb; ipdb.set_trace()
                     predictions.conf -= 1.0 # Conf correction for DA3
 
             elif self.model_type == "MapAnything":
@@ -760,7 +760,7 @@ class Any_Streaming:
             )
 
             aligned_chunk_data["conf"] = chunk_data.conf
-            aligned_chunk_data["processed_images"] = chunk_data.processed_images
+            aligned_chunk_data["images"] = chunk_data.processed_images
             aligned_chunk_data["mask"] = getattr(chunk_data, 'mask', None)
 
             aligned_path = os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx+1}.npy")
@@ -808,7 +808,7 @@ class Any_Streaming:
                     self.save_depth_conf_result(predictions, 0, 1, np.eye(3), np.array([0, 0, 0]))
 
             points = aligned_chunk_data["world_points"].reshape(-1, 3)
-            colors = (aligned_chunk_data["processed_images"].reshape(-1, 3)).astype(np.uint8)
+            colors = (aligned_chunk_data["images"].reshape(-1, 3)).astype(np.uint8)
             ply_path = os.path.join(self.pcd_dir, f"{chunk_idx+1}_pcd.ply")
 
             # Auto-detect: use mask-based saving if mask exists (MapAnything), else conf-based (DA3)
@@ -837,7 +837,7 @@ class Any_Streaming:
                 predictions = chunk_data
                 predictions.depth *= s
                 self.save_depth_conf_result(predictions, chunk_idx + 1, s, R, t)
-        # import ipdb; ipdb.set_trace()
+
         self.save_camera_poses()
 
         # Log final pointcloud and camera trajectory to Rerun
@@ -901,7 +901,6 @@ class Any_Streaming:
         all_intrinsics = [None] * len(self.img_list)
 
         first_chunk_range, first_chunk_extrinsics = self.all_camera_poses[0]
-        # import ipdb; ipdb.set_trace()
         _, first_chunk_intrinsics = self.all_camera_intrinsics[0]
         has_intrinsics = first_chunk_intrinsics is not None
 
@@ -1005,17 +1004,11 @@ class Any_Streaming:
             if os.path.exists(aligned_path):
                 chunk_data = np.load(aligned_path, allow_pickle=True).item()
 
-                def get_val(obj, key):
-                    """Get value from dict or object."""
-                    if isinstance(obj, dict):
-                        return obj.get(key, None)
-                    return getattr(obj, key, None)
-
-                points = get_val(chunk_data, "world_points")
-                if points is not None:
-                    colors = get_val(chunk_data, "processed_images")
-                    mask = get_val(chunk_data, "mask")
-                    conf = get_val(chunk_data, "conf")
+                if "world_points" in chunk_data:
+                    points = chunk_data["world_points"]
+                    colors = chunk_data["images"]
+                    mask = chunk_data.get("mask", None)
+                    conf = chunk_data.get("conf", None)
 
                     # Reshape if needed
                     if points.ndim == 4:
