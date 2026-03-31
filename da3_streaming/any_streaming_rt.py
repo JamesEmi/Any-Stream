@@ -42,6 +42,7 @@ from loop_utils.sim3utils import (
 from safetensors.torch import load_file
 from depth_anything_3.api import DepthAnything3
 from viz_ply_cas import read_gps_csv, build_enu_interpolator, extract_ts_ns, umeyama_alignment
+from eval.kitti_utils import load_kitti_poses, save_kitti_poses
 
 def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
     """
@@ -103,8 +104,9 @@ def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
 
 
 class Any_StreamingRT:
-    def __init__(self, image_dir, save_dir, config, gps_csv=None):
+    def __init__(self, image_dir, save_dir, config, gps_csv=None, kitti_poses=None):
         self.config = config
+        self.kitti_poses_path = kitti_poses
 
         self.chunk_size = self.config["Model"]["chunk_size"]
         self.overlap = self.config["Model"]["overlap"]
@@ -151,6 +153,9 @@ class Any_StreamingRT:
             print(f"GPS loaded: {len(gps_rows)} samples")
         self.acc_cam_positions: list = []   # list of [K,3] arrays, non-overlap camera positions
         self.frame_image_paths: list = []   # parallel to acc_cam_positions (flattened)
+        self.acc_frame_c2w: list = []       # list of [K,4,4] c2w poses per chunk (world frame)
+        self._acc_frame_c2w_local: list = []  # list of [K,4,4] c2w in chunk-local coords (for PGO recompute)
+        self.acc_frame_global_indices: list = []  # list of global frame indices (flattened)
 
         if model_type == "DA3":
             with open(self.config["Weights"]["DA3_CONFIG"]) as f:
@@ -301,6 +306,25 @@ class Any_StreamingRT:
         w2c_4x4[:, 3, 3] = 1.0
         c2w = np.linalg.inv(w2c_4x4)
         return c2w[:, :3, 3]
+
+    @staticmethod
+    def _w2c_to_c2w(extrinsics_w2c: np.ndarray) -> np.ndarray:
+        """Convert W2C extrinsics [N, 3, 4] to C2W [N, 4, 4]."""
+        N = extrinsics_w2c.shape[0]
+        w2c_4x4 = np.zeros((N, 4, 4), dtype=np.float64)
+        w2c_4x4[:, :3, :4] = extrinsics_w2c
+        w2c_4x4[:, 3, 3] = 1.0
+        return np.linalg.inv(w2c_4x4)
+
+    @staticmethod
+    def _apply_sim3_to_c2w(c2w: np.ndarray, s, R, t) -> np.ndarray:
+        """Apply Sim(3) transform to c2w poses [N, 4, 4]. Returns [N, 4, 4]."""
+        out = c2w.copy()
+        # Transform position: p' = s * R @ p + t
+        out[:, :3, 3] = (s * (c2w[:, :3, 3] @ R.T) + t)
+        # Transform rotation: R' = R_sim3 @ R_c2w (scale doesn't affect rotation)
+        out[:, :3, :3] = np.einsum("ij,njk->nik", R, c2w[:, :3, :3])
+        return out
 
     def _extract_new_points(self, predictions, chunk_idx: int, s_abs, R_abs, t_abs,
                             chunk_paths: list = None):
@@ -474,6 +498,161 @@ class Any_StreamingRT:
         print(f"  [rerun/gps] {len(global_pts):,} pts, "
               f"{len(cam_global)} pred poses, {len(gps_f32)} gps poses")
 
+    def _save_poses_kitti(self, out_path: str):
+        """Save accumulated per-frame c2w poses in KITTI format (3x4 per line)."""
+        if not self.acc_frame_c2w:
+            print("  No poses to save.")
+            return
+        all_c2w = np.concatenate(self.acc_frame_c2w, axis=0)  # [N, 4, 4]
+        save_kitti_poses(all_c2w, out_path)
+        print(f"Saved {len(all_c2w)} poses → {out_path}")
+
+    def _recompute_poses_from_sim3(self):
+        """Recompute acc_frame_c2w from stored per-chunk local c2w and updated sim3_list.
+        Called after PGO to update poses with optimized transforms.
+        """
+        if not self.sim3_list:
+            return
+        cumulative = accumulate_sim3_transforms(self.sim3_list)
+        new_c2w = []
+        for i, c2w_local in enumerate(self._acc_frame_c2w_local):
+            if i == 0:
+                new_c2w.append(c2w_local)
+            else:
+                s_abs, R_abs, t_abs = cumulative[i - 1]
+                new_c2w.append(self._apply_sim3_to_c2w(c2w_local, s_abs, R_abs, t_abs))
+        self.acc_frame_c2w = new_c2w
+
+    def _run_gps_pgo(self, kitti_poses_path: str):
+        """GPS-based Pose Graph Optimization.
+
+        The optimizer works in the model's coordinate frame (model scale, model origin).
+        GPS constraints must therefore be expressed in that same frame.
+
+        Since KITTI's first pose is identity (same as the model's origin), the only
+        mismatch between model frame and GT frame is SCALE (and potentially a small
+        global rotation from drift). We handle this with Umeyama:
+
+          s_g * R_g @ pred_pos + t_g ≈ gt_pos
+
+        GPS constraint for pair (i, j) in model frame:
+          R_rel = R_g.T @ (R_i_gt.T @ R_j_gt) @ R_g   (rotate to model orientation)
+          t_rel = (1/s_g) * R_g.T @ (R_i_gt.T @ (t_j_gt - t_i_gt))  (scale to model units)
+          s_rel = pred_scale_j / pred_scale_i   (match accumulated model scale, avoids
+                                                  conflict with sequential constraints)
+
+        Pipeline:
+          1. Compute Umeyama (pred_positions → GT positions) → (s_g, R_g, t_g)
+          2. Build GPS constraints in model frame using the above formulas
+          3. Run Sim3LoopOptimizer on the original (model-frame) sim3_list
+          4. Recompute per-frame poses from optimized sim3_list
+        """
+        from loop_utils.sim3loop import Sim3LoopOptimizer
+
+        print("\n=== GPS-PGO ===")
+        kitti_poses = load_kitti_poses(kitti_poses_path)
+        print(f"Loaded {len(kitti_poses)} GT poses from {kitti_poses_path}")
+
+        if not self.sim3_list:
+            print("  sim3_list empty (single chunk). Skipping PGO.")
+            return
+
+        n_chunks = len(self.chunk_indices)
+        pgo_cfg = self.config.get("GPS_PGO", {})
+
+        # ── representative frame per chunk ────────────────────────────────────
+        chunk_rep_frames = []
+        for ci, (start, end) in enumerate(self.chunk_indices):
+            ov = self.overlap
+            rep = (start + (end - ov - start) // 2) if ci == 0 else \
+                  ((start + ov) + (end - start - ov) // 2)
+            chunk_rep_frames.append(min(rep, len(kitti_poses) - 1))
+
+        chunk_gt = np.array([kitti_poses[f] for f in chunk_rep_frames])
+        chunk_gt_pos = chunk_gt[:, :3, 3]   # [n_chunks, 3] metric
+        chunk_gt_rot = chunk_gt[:, :3, :3]  # [n_chunks, 3, 3]
+
+        # ── predicted chunk positions + accumulated scales in model frame ─────
+        cumulative = accumulate_sim3_transforms(self.sim3_list)
+        pred_positions = [np.zeros(3, dtype=np.float64)]
+        pred_scales    = [1.0]
+        for (s_c, R_c, t_c) in cumulative:
+            pred_positions.append(t_c.astype(np.float64))
+            pred_scales.append(float(s_c))
+        while len(pred_positions) < n_chunks:
+            pred_positions.append(pred_positions[-1])
+            pred_scales.append(pred_scales[-1])
+        pred_pos    = np.array(pred_positions[:n_chunks])   # [n_chunks, 3]
+        pred_scales = pred_scales[:n_chunks]                 # [n_chunks]
+
+        # ── Umeyama: model → GPS  (s_g * R_g @ pred + t_g ≈ gt) ─────────────
+        s_g, R_g, t_g = umeyama_alignment(pred_pos, chunk_gt_pos, with_scale=True)
+        print(f"  [GPS-PGO] Umeyama: scale={s_g:.4f}  "
+              f"|R_g-I|={np.linalg.norm(R_g - np.eye(3)):.4f}  "
+              f"|t_g|={np.linalg.norm(t_g):.3f}m")
+
+        # ── build constraints in model frame ──────────────────────────────────
+        use_skip      = pgo_cfg.get("use_skip_constraints", True)
+        use_proximity = pgo_cfg.get("use_proximity_constraints", True)
+        skip_k        = pgo_cfg.get("skip_k", 5)
+        prox_thresh   = pgo_cfg.get("proximity_threshold", 30.0)
+        min_gap       = pgo_cfg.get("min_gap", 5)
+
+        def _make_constraint(i, j):
+            R_i_gt, R_j_gt = chunk_gt_rot[i], chunk_gt_rot[j]
+            t_i_gt, t_j_gt = chunk_gt_pos[i], chunk_gt_pos[j]
+            # GT relative transform
+            R_gt_rel = R_i_gt.T @ R_j_gt
+            t_gt_rel = R_i_gt.T @ (t_j_gt - t_i_gt)
+            # Rotate to model orientation, scale to model units
+            R_rel = R_g.T @ R_gt_rel @ R_g
+            t_rel = (1.0 / s_g) * (R_g.T @ t_gt_rel)
+            # Match accumulated model scale to avoid conflict with sequential constraints
+            s_rel = pred_scales[j] / pred_scales[i]
+            return (i, j, (float(s_rel), R_rel.astype(np.float32), t_rel.astype(np.float32)))
+
+        constraints = []
+        if use_skip:
+            for i in range(0, n_chunks - skip_k, skip_k):
+                constraints.append(_make_constraint(i, i + skip_k))
+            print(f"  [GPS-PGO] {len(constraints)} skip-{skip_k} constraints")
+
+        n_before = len(constraints)
+        if use_proximity:
+            for i in range(n_chunks):
+                for j in range(i + min_gap, n_chunks):
+                    if np.linalg.norm(chunk_gt_pos[i] - chunk_gt_pos[j]) < prox_thresh:
+                        constraints.append(_make_constraint(i, j))
+            print(f"  [GPS-PGO] {len(constraints) - n_before} proximity constraints "
+                  f"(threshold={prox_thresh}m)")
+
+        print(f"  [GPS-PGO] {len(constraints)} total constraints for {n_chunks} chunks")
+        if not constraints:
+            print("  No GPS constraints generated. Skipping PGO.")
+            return
+
+        # ── PGO on original model-frame sim3_list ─────────────────────────────
+        optimizer = Sim3LoopOptimizer(self.config, device="cpu")
+        optimized_sim3 = optimizer.optimize(self.sim3_list, constraints)
+        self.sim3_list = optimized_sim3
+
+        # ── recompute per-frame poses from optimized sim3_list ────────────────
+        self._recompute_poses_from_sim3()
+
+        cumulative_new = accumulate_sim3_transforms(self.sim3_list)
+        new_cam_positions = []
+        for i, c2w_local in enumerate(self._acc_frame_c2w_local):
+            if i == 0:
+                new_cam_positions.append(c2w_local[:, :3, 3].astype(np.float32))
+            else:
+                s_abs, R_abs, t_abs = cumulative_new[i - 1]
+                pos = c2w_local[:, :3, 3]
+                new_cam_positions.append(
+                    (s_abs * (pos @ R_abs.T) + t_abs).astype(np.float32)
+                )
+        self.acc_cam_positions = new_cam_positions
+        print("  GPS-PGO complete. Poses updated.\n")
+
     def run(self):
         print(f"Loading images from {self.img_dir}...")
         img_list = sorted(
@@ -526,6 +705,24 @@ class Any_StreamingRT:
             self.acc_cam_positions.append(cam_pos)
             self.frame_image_paths.extend(frame_paths)
 
+            # Collect per-frame c2w poses for evaluation
+            n_frames = len(cur_pred.depth)
+            ov = self.overlap
+            if chunk_idx == 0:
+                sl = slice(0, n_frames - ov)
+                global_indices = list(range(start, start + n_frames - ov))
+            else:
+                sl = slice(ov, n_frames)
+                global_indices = list(range(start + ov, end))
+            c2w_local = self._w2c_to_c2w(cur_pred.extrinsics[sl])
+            self._acc_frame_c2w_local.append(c2w_local.copy())
+            if chunk_idx > 0:
+                c2w_world = self._apply_sim3_to_c2w(c2w_local, s_abs, R_abs, t_abs)
+            else:
+                c2w_world = c2w_local
+            self.acc_frame_c2w.append(c2w_world)
+            self.acc_frame_global_indices.extend(global_indices)
+
             self._log_to_rerun()
 
             # GPS alignment (optional)
@@ -552,7 +749,21 @@ class Any_StreamingRT:
         print(f"Alignment:  {self.total_align_time:.2f}s")
         print(f"Wall time:  {total_time:.2f}s")
         print(f"Per image:  {self.total_infer_time / len(img_list):.3f}s")
-        
+
+        # Save baseline poses (before PGO)
+        baseline_pose_path = os.path.join(self.output_dir, "poses_pred_baseline.txt")
+        self._save_poses_kitti(baseline_pose_path)
+
+        # GPS-PGO (if kitti_poses provided)
+        if self.kitti_poses_path is not None:
+            self._run_gps_pgo(self.kitti_poses_path)
+            pgo_pose_path = os.path.join(self.output_dir, "poses_pred_pgo.txt")
+            self._save_poses_kitti(pgo_pose_path)
+
+        # Save final poses (post-PGO if run, otherwise same as baseline)
+        final_pose_path = os.path.join(self.output_dir, "poses_pred.txt")
+        self._save_poses_kitti(final_pose_path)
+
         if self.acc_pts:
             all_pts  = np.concatenate(self.acc_pts,  axis=0)
             all_cols = np.concatenate(self.acc_cols, axis=0)
@@ -620,6 +831,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--gps_csv",    type=str, default=None,
                         help="Path to GPS CSV file for global alignment (optional)")
+    parser.add_argument("--kitti_poses", type=str, default=None,
+                        help="Path to KITTI GT poses file for GPS-PGO (e.g. poses/07.txt)")
     rr.script_add_args(parser)  # adds --rr-addr, --save etc; must be called before parse_args
     args = parser.parse_args()
 
@@ -640,7 +853,8 @@ if __name__ == "__main__":
     if config["Model"]["align_lib"] == "numba":
         warmup_numba()
 
-    streamer = Any_StreamingRT(args.image_dir, args.output_dir, config, gps_csv=args.gps_csv)
+    streamer = Any_StreamingRT(args.image_dir, args.output_dir, config,
+                               gps_csv=args.gps_csv, kitti_poses=args.kitti_poses)
     streamer.run()
 
     del streamer
