@@ -52,5 +52,5 @@ Loop:
     lambda_init: 1e-6
 
 GPS_PGO:
-  enabled: true
+  enabled: false
   gps_every_k: 1                   # anchor every k-th chunk to its GT pose (1 = every chunk)

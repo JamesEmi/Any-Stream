@@ -524,28 +524,28 @@ class Any_StreamingRT:
         self.acc_frame_c2w = new_c2w
 
     def _run_gps_pgo(self, kitti_poses_path: str):
-        """GPS-based Pose Graph Optimization.
+        """GPS-based Pose Graph Optimization using absolute anchor constraints.
 
-        The optimizer works in the model's coordinate frame (model scale, model origin).
-        GPS constraints must therefore be expressed in that same frame.
+        Each GPS constraint anchors chunk k to its GT position expressed in model frame:
+          constraint (0, k, S_k)  where S_k = T_global^{-1} ∘ T_k_gt
 
-        Since KITTI's first pose is identity (same as the model's origin), the only
-        mismatch between model frame and GT frame is SCALE (and potentially a small
-        global rotation from drift). We handle this with Umeyama:
+        Since T_0 = Identity, pairwise (0, k, S_k) is equivalent to setting the
+        absolute pose of node k. The optimizer adjusts sequential transforms to satisfy
+        all anchors simultaneously.
 
-          s_g * R_g @ pred_pos + t_g ≈ gt_pos
+        Umeyama: s_g * R_g @ pred + t_g ≈ gt  maps model frame → GPS (metric) frame.
+        Inverse: pos_model = (1/s_g) * R_g.T @ (pos_gps - t_g)
 
-        GPS constraint for pair (i, j) in model frame:
-          R_rel = R_g.T @ (R_i_gt.T @ R_j_gt) @ R_g   (rotate to model orientation)
-          t_rel = (1/s_g) * R_g.T @ (R_i_gt.T @ (t_j_gt - t_i_gt))  (scale to model units)
-          s_rel = pred_scale_j / pred_scale_i   (match accumulated model scale, avoids
-                                                  conflict with sequential constraints)
+        S_k components in model frame:
+          R_k = R_g.T @ R_k_gt
+          t_k = (1/s_g) * R_g.T @ (t_k_gt - t_g)
+          s_k = pred_scales[k]   (keep accumulated model scale, avoids scale conflict)
 
-        Pipeline:
-          1. Compute Umeyama (pred_positions → GT positions) → (s_g, R_g, t_g)
-          2. Build GPS constraints in model frame using the above formulas
-          3. Run Sim3LoopOptimizer on the original (model-frame) sim3_list
-          4. Recompute per-frame poses from optimized sim3_list
+        Why use original model-frame sim3_list?
+          Sequential transforms S_{k,k+1} = T_k^{-1} ∘ T_{k+1} are invariant to any
+          global frame change: (T_g∘T_k)^{-1}∘(T_g∘T_{k+1}) = T_k^{-1}∘T_{k+1}.
+          There is no "aligned sim3_list" — it's the same list. The GPS constraints
+          encode the alignment inside themselves; no preprocessing of sim3_list needed.
         """
         from loop_utils.sim3loop import Sim3LoopOptimizer
 
@@ -559,6 +559,7 @@ class Any_StreamingRT:
 
         n_chunks = len(self.chunk_indices)
         pgo_cfg = self.config.get("GPS_PGO", {})
+        gps_every_k = pgo_cfg.get("gps_every_k", 5)
 
         # ── representative frame per chunk ────────────────────────────────────
         chunk_rep_frames = []
@@ -591,42 +592,26 @@ class Any_StreamingRT:
               f"|R_g-I|={np.linalg.norm(R_g - np.eye(3)):.4f}  "
               f"|t_g|={np.linalg.norm(t_g):.3f}m")
 
-        # ── build constraints in model frame ──────────────────────────────────
-        use_skip      = pgo_cfg.get("use_skip_constraints", True)
-        use_proximity = pgo_cfg.get("use_proximity_constraints", True)
-        skip_k        = pgo_cfg.get("skip_k", 5)
-        prox_thresh   = pgo_cfg.get("proximity_threshold", 30.0)
-        min_gap       = pgo_cfg.get("min_gap", 5)
-
-        def _make_constraint(i, j):
-            R_i_gt, R_j_gt = chunk_gt_rot[i], chunk_gt_rot[j]
-            t_i_gt, t_j_gt = chunk_gt_pos[i], chunk_gt_pos[j]
-            # GT relative transform
-            R_gt_rel = R_i_gt.T @ R_j_gt
-            t_gt_rel = R_i_gt.T @ (t_j_gt - t_i_gt)
-            # Rotate to model orientation, scale to model units
-            R_rel = R_g.T @ R_gt_rel @ R_g
-            t_rel = (1.0 / s_g) * (R_g.T @ t_gt_rel)
-            # Match accumulated model scale to avoid conflict with sequential constraints
-            s_rel = pred_scales[j] / pred_scales[i]
-            return (i, j, (float(s_rel), R_rel.astype(np.float32), t_rel.astype(np.float32)))
+        # ── build absolute anchor constraints: (0, k, S_k) ───────────────────
+        # S_k = T_global^{-1} ∘ T_k_gt expressed in model frame
+        def _abs_constraint(k):
+            # T_k_desired in model frame:
+            #   R = R_g.T @ R_k_gt  (GPS rotation → model frame)
+            #   t = (1/s_g) * R_g.T @ (t_k_gt - t_g)  (GPS position → model scale)
+            #   s = pred_scales[k]  (keep accumulated model scale)
+            # Convention: (i, j, S) makes T_j = T_i @ S^{-1}.
+            # We want T_k = T_k_desired when T_0 ≈ Identity.
+            # (k, 0, T_k_desired) → T_0 = T_k @ T_k_desired^{-1} ≈ Identity → T_k ≈ T_k_desired ✓
+            R_k = R_g.T @ chunk_gt_rot[k]
+            t_k = (1.0 / s_g) * (R_g.T @ (chunk_gt_pos[k] - t_g))
+            s_k = float(pred_scales[k])
+            return (k, 0, (s_k, R_k.astype(np.float32), t_k.astype(np.float32)))
 
         constraints = []
-        if use_skip:
-            for i in range(0, n_chunks - skip_k, skip_k):
-                constraints.append(_make_constraint(i, i + skip_k))
-            print(f"  [GPS-PGO] {len(constraints)} skip-{skip_k} constraints")
-
-        n_before = len(constraints)
-        if use_proximity:
-            for i in range(n_chunks):
-                for j in range(i + min_gap, n_chunks):
-                    if np.linalg.norm(chunk_gt_pos[i] - chunk_gt_pos[j]) < prox_thresh:
-                        constraints.append(_make_constraint(i, j))
-            print(f"  [GPS-PGO] {len(constraints) - n_before} proximity constraints "
-                  f"(threshold={prox_thresh}m)")
-
-        print(f"  [GPS-PGO] {len(constraints)} total constraints for {n_chunks} chunks")
+        for k in range(1, n_chunks, gps_every_k):
+            constraints.append(_abs_constraint(k))
+        print(f"  [GPS-PGO] {len(constraints)} absolute anchor constraints "
+              f"(every {gps_every_k} chunks, {n_chunks} total)")
         if not constraints:
             print("  No GPS constraints generated. Skipping PGO.")
             return

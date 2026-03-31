@@ -69,7 +69,7 @@ def extract_ts_ns(path: str) -> Optional[int]:
     """Extract timestamp in nanoseconds from image filename."""
     base = os.path.basename(path)
     stem, _ = os.path.splitext(base)
-    m = re.match(r"^(\d{12,})$", stem)
+    m = re.search(r"(\d{12,})", stem)
     if m:
         try:
             return int(m.group(1))
