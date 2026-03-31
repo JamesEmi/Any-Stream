@@ -414,6 +414,16 @@ class Any_StreamingRT:
         print(f"  [rerun] {len(all_pts):,} pts logged  "
               f"(total acc: {sum(len(p) for p in self.acc_pts):,})")
 
+        # Rolling predicted trajectory (model frame, white)
+        if self.acc_cam_positions:
+            traj = np.concatenate(self.acc_cam_positions, axis=0).astype(np.float32)
+            rr.log("trajectories/pred", rr.Points3D(
+                positions=traj,
+                colors=np.full((len(traj), 3), [255, 255, 255], dtype=np.uint8),
+            ))
+            if len(traj) >= 2:
+                rr.log("trajectories/pred_line", rr.LineStrips3D([traj], colors=[[255, 255, 255]]))
+
     def _compute_gps_alignment(self):
         """
         Compute Umeyama alignment from accumulated local camera positions to GPS ENU.
@@ -636,6 +646,21 @@ class Any_StreamingRT:
                     (s_abs * (pos @ R_abs.T) + t_abs).astype(np.float32)
                 )
         self.acc_cam_positions = new_cam_positions
+
+        # Log GT trajectory in model frame (static — visible at all timesteps, green)
+        # GT → model frame: pos_model = (1/s_g) * R_g.T @ (pos_gt - t_g)
+        n_gt = min(len(kitti_poses), sum(len(p) for p in self.acc_cam_positions))
+        gt_pos_all = kitti_poses[:n_gt, :3, 3]
+        gt_model = ((1.0 / s_g) * ((gt_pos_all - t_g) @ R_g)).astype(np.float32)
+        rr.log("trajectories/gt", rr.Points3D(
+            positions=gt_model,
+            colors=np.full((len(gt_model), 3), [0, 255, 0], dtype=np.uint8),
+        ), static=True)
+        if len(gt_model) >= 2:
+            rr.log("trajectories/gt_line", rr.LineStrips3D(
+                [gt_model], colors=[[0, 255, 0]],
+            ), static=True)
+
         print("  GPS-PGO complete. Poses updated.\n")
 
     def run(self):
@@ -710,6 +735,16 @@ class Any_StreamingRT:
 
             self._log_to_rerun()
 
+            # Log current frame image to Rerun
+            if frame_paths:
+                try:
+                    from PIL import Image as PILImage
+                    img = PILImage.open(frame_paths[-1]).convert("RGB")
+                    rr.set_time("stable_time", sequence=self._rr_time - 1)
+                    rr.log("camera/image", rr.Image(np.array(img)))
+                except Exception as e:
+                    print(f"  [rerun] image log failed: {e}")
+
             # GPS alignment (optional)
             gps_result = self._compute_gps_alignment()
             if gps_result is not None:
@@ -739,11 +774,37 @@ class Any_StreamingRT:
         baseline_pose_path = os.path.join(self.output_dir, "poses_pred_baseline.txt")
         self._save_poses_kitti(baseline_pose_path)
 
+        # Log baseline trajectory to Rerun (yellow, timestep N)
+        if self.acc_cam_positions:
+            rr.set_time("stable_time", sequence=self._rr_time)
+            baseline_traj = np.concatenate(self.acc_cam_positions, axis=0).astype(np.float32)
+            rr.log("trajectories/baseline", rr.Points3D(
+                positions=baseline_traj,
+                colors=np.full((len(baseline_traj), 3), [255, 220, 0], dtype=np.uint8),
+            ))
+            if len(baseline_traj) >= 2:
+                rr.log("trajectories/baseline_line", rr.LineStrips3D(
+                    [baseline_traj], colors=[[255, 220, 0]],
+                ))
+
         # GPS-PGO (if kitti_poses provided)
         if self.kitti_poses_path is not None:
-            self._run_gps_pgo(self.kitti_poses_path)
+            self._run_gps_pgo(self.kitti_poses_path)  # also logs GT (static, green)
             pgo_pose_path = os.path.join(self.output_dir, "poses_pred_pgo.txt")
             self._save_poses_kitti(pgo_pose_path)
+
+            # Log PGO trajectory to Rerun (cyan, timestep N+1 → scrub to see correction)
+            self._rr_time += 1
+            rr.set_time("stable_time", sequence=self._rr_time)
+            pgo_traj = np.concatenate(self.acc_cam_positions, axis=0).astype(np.float32)
+            rr.log("trajectories/pgo", rr.Points3D(
+                positions=pgo_traj,
+                colors=np.full((len(pgo_traj), 3), [0, 220, 255], dtype=np.uint8),
+            ))
+            if len(pgo_traj) >= 2:
+                rr.log("trajectories/pgo_line", rr.LineStrips3D(
+                    [pgo_traj], colors=[[0, 220, 255]],
+                ))
 
         # Save final poses (post-PGO if run, otherwise same as baseline)
         final_pose_path = os.path.join(self.output_dir, "poses_pred.txt")
