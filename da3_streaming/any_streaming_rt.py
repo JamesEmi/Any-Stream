@@ -879,10 +879,14 @@ if __name__ == "__main__":
                         help="Path to GPS CSV file for global alignment (optional)")
     parser.add_argument("--kitti_poses", type=str, default=None,
                         help="Path to KITTI GT poses file for GPS-PGO (e.g. poses/07.txt)")
+    parser.add_argument("--gps_every_k", type=int, default=None,
+                        help="Override GPS_PGO.gps_every_k from config (anchor every k-th chunk)")
     rr.script_add_args(parser)  # adds --rr-addr, --save etc; must be called before parse_args
     args = parser.parse_args()
 
     config = load_config(args.config)
+    if args.gps_every_k is not None:
+        config.setdefault("GPS_PGO", {})["gps_every_k"] = args.gps_every_k
 
     if args.output_dir is None:
         ts = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
