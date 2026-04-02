@@ -5,8 +5,8 @@ Weights:
   SALAD: '/mnt/data/any-stream/any-stream/weights/dino_salad.ckpt'
 
 Model:
-  chunk_size: 10
-  overlap: 5
+  chunk_size: 60
+  overlap: 30
   loop_chunk_size: 20
   loop_enable: False
   useDBoW: False
@@ -53,4 +53,5 @@ Loop:
 
 GPS_PGO:
   enabled: true
-  gps_every_k: 5                   # anchor every k-th chunk to its GT pose (1 = every chunk)
+  method: 'pgo'            # 'anchor_warp' (piecewise-linear, preserves local shape) or 'pgo' (joint factor graph)
+  gps_every_k: 10                   # anchor every k-th chunk to its GT pose (1 = every chunk)
