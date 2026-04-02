@@ -719,8 +719,12 @@ class Any_StreamingRT:
             for cam_pos in self.acc_cam_positions:
                 cam_pos += self.gps_t0_correction
 
+        # Strip GPS correction before retransform: it uses raw model-frame transforms stored
+        # in _acc_chunk_sim3, so acc_pts must be in raw model frame for the undo step to work.
+        if np.linalg.norm(self.gps_t0_correction) > 1e-4:
+            self.acc_pts = [p - self.gps_t0_correction for p in self.acc_pts]
         self._retransform_pointcloud()
-        # Re-apply GPS start anchor to point clouds (wiped by _retransform_pointcloud)
+        # Re-apply GPS start anchor after retransform
         if np.linalg.norm(self.gps_t0_correction) > 1e-4:
             delta = self.gps_t0_correction.astype(np.float32)
             self.acc_pts = [p + delta for p in self.acc_pts]
