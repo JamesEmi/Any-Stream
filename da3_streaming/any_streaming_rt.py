@@ -152,6 +152,8 @@ class Any_StreamingRT:
             gps_rows = read_gps_csv(gps_csv)
             self.gps_interp, self.gps_meta = build_enu_interpolator(gps_rows)
             print(f"GPS loaded: {len(gps_rows)} samples")
+        self.gps_t0_correction = np.zeros(3, dtype=np.float32)  # model-frame shift: pred[0] → GT[0]
+        self._kitti_poses_cache: np.ndarray | None = None        # loaded once, reused every chunk
         self.acc_cam_positions: list = []   # list of [K,3] arrays, non-overlap camera positions
         self.frame_image_paths: list = []   # parallel to acc_cam_positions (flattened)
         self.acc_frame_c2w: list = []       # list of [K,4,4] c2w poses per chunk (world frame)
@@ -528,11 +530,15 @@ class Any_StreamingRT:
         new_c2w = []
         for i, c2w_local in enumerate(self._acc_frame_c2w_local):
             if i == 0:
-                new_c2w.append(c2w_local)
+                new_c2w.append(c2w_local.copy())  # copy to avoid aliasing _acc_frame_c2w_local[0]
             else:
                 s_abs, R_abs, t_abs = cumulative[i - 1]
                 new_c2w.append(self._apply_sim3_to_c2w(c2w_local, s_abs, R_abs, t_abs))
         self.acc_frame_c2w = new_c2w
+        # Re-apply GPS start anchor (wiped by the model-frame rebuild above)
+        if np.linalg.norm(self.gps_t0_correction) > 1e-4:
+            for c2w_chunk in self.acc_frame_c2w:
+                c2w_chunk[:, :3, 3] += self.gps_t0_correction
 
     def _retransform_pointcloud(self):
         """Retransform acc_pts from pre-PGO chunk transforms to post-PGO ones.
@@ -572,11 +578,17 @@ class Any_StreamingRT:
 
         Returns (s_g, R_g, t_g, chunk_gt_pos, chunk_gt_rot, pred_pos, pred_scales)
         where  s_g * R_g @ pred + t_g ≈ gt  (model → GPS frame).
+
+        Only uses chunks that have actually been processed (len(sim3_list) + 1), so this
+        is safe to call mid-stream without contaminating the fit with extrapolated future positions.
         """
-        n_chunks = len(self.chunk_indices)
+        n_chunks_total = len(self.chunk_indices)
+        # Cap to the number of processed chunks: sim3_list has one entry per chunk-to-chunk
+        # transition, so processed count = len(sim3_list) + 1.
+        n_chunks = min(n_chunks_total, len(self.sim3_list) + 1)
 
         chunk_rep_frames = []
-        for ci, (start, end) in enumerate(self.chunk_indices):
+        for ci, (start, end) in enumerate(self.chunk_indices[:n_chunks]):
             ov = self.overlap
             rep = (start + (end - ov - start) // 2) if ci == 0 else \
                   ((start + ov) + (end - start - ov) // 2)
@@ -589,12 +601,9 @@ class Any_StreamingRT:
         cumulative = accumulate_sim3_transforms(self.sim3_list) if self.sim3_list else []
         pred_positions = [np.zeros(3, dtype=np.float64)]
         pred_scales    = [1.0]
-        for (s_c, R_c, t_c) in cumulative:
+        for (s_c, R_c, t_c) in cumulative[:n_chunks - 1]:  # only processed transitions
             pred_positions.append(t_c.astype(np.float64))
             pred_scales.append(float(s_c))
-        while len(pred_positions) < n_chunks:
-            pred_positions.append(pred_positions[-1])
-            pred_scales.append(pred_scales[-1])
         pred_pos    = np.array(pred_positions[:n_chunks])
         pred_scales = pred_scales[:n_chunks]
 
@@ -705,8 +714,16 @@ class Any_StreamingRT:
                     (s_abs * (pos @ R_abs.T) + t_abs).astype(np.float32)
                 )
         self.acc_cam_positions = new_cam_positions
+        # Re-apply GPS start anchor to cam positions (wiped by the model-frame rebuild above)
+        if np.linalg.norm(self.gps_t0_correction) > 1e-4:
+            for cam_pos in self.acc_cam_positions:
+                cam_pos += self.gps_t0_correction
 
         self._retransform_pointcloud()
+        # Re-apply GPS start anchor to point clouds (wiped by _retransform_pointcloud)
+        if np.linalg.norm(self.gps_t0_correction) > 1e-4:
+            delta = self.gps_t0_correction.astype(np.float32)
+            self.acc_pts = [p + delta for p in self.acc_pts]
 
         print("  GPS-PGO complete. Poses updated.\n")
 
@@ -859,6 +876,41 @@ class Any_StreamingRT:
                 c2w_world = c2w_local
             self.acc_frame_c2w.append(c2w_world)
             self.acc_frame_global_indices.extend(global_indices)
+
+            # Progressive GPS start anchor: keep pred[0] pinned to GT[0] as Umeyama improves
+            if chunk_idx >= 1 and self.kitti_poses_path is not None:
+                if self._kitti_poses_cache is None:
+                    self._kitti_poses_cache = load_kitti_poses(self.kitti_poses_path)
+                try:
+                    s_g, R_g, t_g, chunk_gt_pos, *_ = self._fit_gt_alignment(self._kitti_poses_cache)
+                    t0_new = ((1.0 / s_g) * (R_g.T @ (chunk_gt_pos[0] - t_g))).astype(np.float32)
+                    delta = t0_new - self.gps_t0_correction
+                    if np.linalg.norm(delta) > 1e-4:
+                        for c2w_chunk in self.acc_frame_c2w:
+                            c2w_chunk[:, :3, 3] += delta
+                        for cam_pos in self.acc_cam_positions:
+                            cam_pos += delta
+                        for i in range(len(self.acc_pts)):
+                            self.acc_pts[i] = self.acc_pts[i] + delta
+                        print(f"  [GPS-anchor] Δ={np.linalg.norm(delta):.4f}m  "
+                              f"total={np.linalg.norm(t0_new):.4f}m")
+                        self.gps_t0_correction = t0_new
+
+                    # Log GT trajectory up to current chunk end frame in model frame
+                    cur_end = self.chunk_indices[chunk_idx][1]
+                    gt_pos = self._kitti_poses_cache[:cur_end, :3, 3]
+                    gt_model = ((1.0 / s_g) * ((gt_pos - t_g) @ R_g)).astype(np.float32)
+                    rr.set_time("stable_time", sequence=self._rr_time)
+                    rr.log("trajectories/gt", rr.Points3D(
+                        positions=gt_model,
+                        colors=np.full((len(gt_model), 3), [0, 255, 0], dtype=np.uint8),
+                    ))
+                    if len(gt_model) >= 2:
+                        rr.log("trajectories/gt_line", rr.LineStrips3D(
+                            [gt_model], colors=[[0, 255, 0]]
+                        ))
+                except Exception as e:
+                    print(f"  [GPS-anchor] Skipped chunk {chunk_idx}: {e}")
 
             self._log_to_rerun()
 
