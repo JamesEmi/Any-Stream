@@ -15,7 +15,7 @@
 # Adapted from [VGGT-Long](https://github.com/DengKaiCQ/VGGT-Long)
 
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import numpy as np
 import pypose as pp
 import torch
@@ -208,6 +208,7 @@ class Sim3LoopOptimizer:
         loop_constraints: List[Tuple[int, int, Tuple[float, np.ndarray, np.ndarray]]],
         max_iterations: int = None,
         lambda_init: float = None,
+        t0_prior: Tuple[float, np.ndarray, np.ndarray] | None = None,
     ) -> List[Tuple[float, np.ndarray, np.ndarray]]:
         """
         Main optimization function
@@ -217,6 +218,9 @@ class Sim3LoopOptimizer:
             loop_constraints: List of loop closure constraints
             max_iterations: Maximum iterations
             lambda_init: Initial lambda for L-M algorithm
+            t0_prior: Optional (s, R, t) GPS-derived prior for the first pose (T_0).
+                If provided, T_0 is initialized to this pose and pinned (not updated)
+                throughout the optimization, fixing the gauge to the GPS start position.
 
         Returns:
             Optimized sequence of transforms
@@ -227,6 +231,13 @@ class Sim3LoopOptimizer:
             lambda_init = eval(self.config["Loop"]["SIM3_Optimizer"]["lambda_init"])
 
         input_poses = self.sequential_to_absolute_poses(sequential_transforms)
+
+        # Pin T_0 to GPS start: override the identity initialisation with the prior.
+        if t0_prior is not None:
+            s0, R0, t0 = t0_prior
+            t0_sim3 = self.numpy_to_pypose_sim3(s0, R0, t0)
+            input_poses = input_poses.clone()
+            input_poses[0] = t0_sim3.data
 
         dSloop, ii_loop, jj_loop = self.build_loop_constraints(loop_constraints)
 
@@ -241,6 +252,7 @@ class Sim3LoopOptimizer:
         print(
             f"Starting optimization with {len(sequential_transforms)} poses \
                 and {len(loop_constraints)} loop constraints"
+            + (f" [T0 pinned]" if t0_prior is not None else "")
         )
 
         # L-M loop
@@ -272,6 +284,11 @@ class Sim3LoopOptimizer:
             except Exception as e:
                 print(f"Solver failed at iteration {itr}: {e}")
                 break
+
+            # Keep T_0 pinned: zero out its update so it stays at the GPS prior.
+            if t0_prior is not None:
+                delta_pose = delta_pose.clone()
+                delta_pose[0] = 0
 
             Ginv_tmp = Ginv + delta_pose
 

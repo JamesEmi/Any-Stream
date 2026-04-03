@@ -11,7 +11,7 @@ DA3_DIR="$(dirname "$SCRIPT_DIR")"
 
 IMAGE_ROOT="/mnt/data/anyslam/KITTI_odometry/dataset/sequences"
 POSES_ROOT="/mnt/data/anyslam/KITTI_odometry/dataset/poses"
-EXP_ROOT="/mnt/data/slam-proj/exps/kitti_sweep"
+EXP_ROOT="/mnt/data/slam-proj/exps/kitti_sweep_gps_t0_prior"
 CONFIG="$DA3_DIR/configs/kitti_rt.yaml"
 PY="$DA3_DIR/any_streaming_rt.py"
 

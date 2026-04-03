@@ -5,7 +5,8 @@ import re
 import os
 import sys
 
-EXP_ROOT = "/mnt/data/slam-proj/exps/kitti_sweep"
+# EXP_ROOT = "/mnt/data/slam-proj/exps/kitti_sweep"
+EXP_ROOT = "/mnt/data/slam-proj/exps/kitti_sweep_gps_t0_prior"
 if len(sys.argv) > 1:
     EXP_ROOT = sys.argv[1]
 
@@ -57,7 +58,7 @@ table = "\n".join(lines)
 print(table)
 
 # Save to file
-out_path = os.path.join(EXP_ROOT, "summary.txt")
+out_path = os.path.join(EXP_ROOT, "summary_v2.txt")
 with open(out_path, "w") as f:
     f.write(table + "\n")
 print(f"\nSaved → {out_path}")

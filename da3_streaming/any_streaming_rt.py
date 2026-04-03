@@ -670,6 +670,15 @@ class Any_StreamingRT:
               f"|R_g-I|={np.linalg.norm(R_g - np.eye(3)):.4f}  "
               f"|t_g|={np.linalg.norm(t_g):.3f}m")
 
+        # ── GPS start prior: pin T_0 to its GPS-derived position in model frame ─
+        # Use full-trajectory Umeyama (all chunks now available) for best estimate.
+        t0_anchor = ((1.0 / s_g) * (R_g.T @ (chunk_gt_pos[0] - t_g))).astype(np.float32)
+        t0_prior = (float(pred_scales[0]),
+                    (R_g.T @ chunk_gt_rot[0]).astype(np.float32),
+                    t0_anchor)
+        self.gps_t0_correction = t0_anchor
+        print(f"  [GPS-PGO] T0 prior: |t0_anchor|={np.linalg.norm(t0_anchor):.4f}m")
+
         # ── build absolute anchor constraints: (0, k, S_k) ───────────────────
         # S_k = T_global^{-1} ∘ T_k_gt expressed in model frame
         def _abs_constraint(k):
@@ -696,7 +705,7 @@ class Any_StreamingRT:
 
         # ── PGO on original model-frame sim3_list ─────────────────────────────
         optimizer = Sim3LoopOptimizer(self.config, device="cpu")
-        optimized_sim3 = optimizer.optimize(self.sim3_list, constraints)
+        optimized_sim3 = optimizer.optimize(self.sim3_list, constraints, t0_prior=t0_prior)
         self.sim3_list = optimized_sim3
 
         # ── recompute per-frame poses from optimized sim3_list ────────────────
@@ -719,10 +728,6 @@ class Any_StreamingRT:
             for cam_pos in self.acc_cam_positions:
                 cam_pos += self.gps_t0_correction
 
-        # Strip GPS correction before retransform: it uses raw model-frame transforms stored
-        # in _acc_chunk_sim3, so acc_pts must be in raw model frame for the undo step to work.
-        if np.linalg.norm(self.gps_t0_correction) > 1e-4:
-            self.acc_pts = [p - self.gps_t0_correction for p in self.acc_pts]
         self._retransform_pointcloud()
         # Re-apply GPS start anchor after retransform
         if np.linalg.norm(self.gps_t0_correction) > 1e-4:
@@ -881,26 +886,12 @@ class Any_StreamingRT:
             self.acc_frame_c2w.append(c2w_world)
             self.acc_frame_global_indices.extend(global_indices)
 
-            # Progressive GPS start anchor: keep pred[0] pinned to GT[0] as Umeyama improves
+            # Log GT trajectory up to current chunk end frame in model frame (visualization only)
             if chunk_idx >= 1 and self.kitti_poses_path is not None:
                 if self._kitti_poses_cache is None:
                     self._kitti_poses_cache = load_kitti_poses(self.kitti_poses_path)
                 try:
                     s_g, R_g, t_g, chunk_gt_pos, *_ = self._fit_gt_alignment(self._kitti_poses_cache)
-                    t0_new = ((1.0 / s_g) * (R_g.T @ (chunk_gt_pos[0] - t_g))).astype(np.float32)
-                    delta = t0_new - self.gps_t0_correction
-                    if np.linalg.norm(delta) > 1e-4:
-                        for c2w_chunk in self.acc_frame_c2w:
-                            c2w_chunk[:, :3, 3] += delta
-                        for cam_pos in self.acc_cam_positions:
-                            cam_pos += delta
-                        for i in range(len(self.acc_pts)):
-                            self.acc_pts[i] = self.acc_pts[i] + delta
-                        print(f"  [GPS-anchor] Δ={np.linalg.norm(delta):.4f}m  "
-                              f"total={np.linalg.norm(t0_new):.4f}m")
-                        self.gps_t0_correction = t0_new
-
-                    # Log GT trajectory up to current chunk end frame in model frame
                     cur_end = self.chunk_indices[chunk_idx][1]
                     gt_pos = self._kitti_poses_cache[:cur_end, :3, 3]
                     gt_model = ((1.0 / s_g) * ((gt_pos - t_g) @ R_g)).astype(np.float32)
@@ -914,7 +905,7 @@ class Any_StreamingRT:
                             [gt_model], colors=[[0, 255, 0]]
                         ))
                 except Exception as e:
-                    print(f"  [GPS-anchor] Skipped chunk {chunk_idx}: {e}")
+                    print(f"  [GPS-vis] Skipped chunk {chunk_idx}: {e}")
 
             self._log_to_rerun()
 
