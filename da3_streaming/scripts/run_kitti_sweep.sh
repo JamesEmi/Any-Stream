@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# KITTI sweep: baseline (no PGO) + GPS-PGO at k=1,5,10 for sequences 00-10
+# KITTI sweep: baseline (no PGO) + GPS-PGO at k=1,5,10 for sequences 00-10 (no T0 start prior)
 # Usage: bash scripts/run_kitti_sweep.sh [seq_ids...]
 # Example: bash scripts/run_kitti_sweep.sh 07        # single seq
 #          bash scripts/run_kitti_sweep.sh           # all seqs 00-10
@@ -11,7 +11,7 @@ DA3_DIR="$(dirname "$SCRIPT_DIR")"
 
 IMAGE_ROOT="/mnt/data/anyslam/KITTI_odometry/dataset/sequences"
 POSES_ROOT="/mnt/data/anyslam/KITTI_odometry/dataset/poses"
-EXP_ROOT="/mnt/data/slam-proj/exps/kitti_sweep_gps_t0_prior"
+EXP_ROOT="/mnt/data/slam-proj/exps/kitti_sweep_gps_no_prior"
 CONFIG="$DA3_DIR/configs/kitti_rt.yaml"
 PY="$DA3_DIR/any_streaming_rt.py"
 

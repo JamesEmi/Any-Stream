@@ -206,6 +206,7 @@ class Sim3LoopOptimizer:
         self,
         sequential_transforms: List[Tuple[float, np.ndarray, np.ndarray]],
         loop_constraints: List[Tuple[int, int, Tuple[float, np.ndarray, np.ndarray]]],
+        position_constraints=None,
         max_iterations: int = None,
         lambda_init: float = None,
         t0_prior: Tuple[float, np.ndarray, np.ndarray] | None = None,
@@ -216,6 +217,9 @@ class Sim3LoopOptimizer:
         Args:
             sequential_transforms: Input sequence of transforms
             loop_constraints: List of loop closure constraints
+            position_constraints: Optional list of (chunk_k: int, p_k: np.ndarray shape (3,))
+                translation-only anchor constraints from GPS. Each constrains only the
+                translation of chunk k's absolute pose; rotation and scale are left free.
             max_iterations: Maximum iterations
             lambda_init: Initial lambda for L-M algorithm
             t0_prior: Optional (s, R, t) GPS-derived prior for the first pose (T_0).
@@ -241,17 +245,32 @@ class Sim3LoopOptimizer:
 
         dSloop, ii_loop, jj_loop = self.build_loop_constraints(loop_constraints)
 
-        if len(loop_constraints) == 0:
-            print("Warning: No loop constraints provided, returning original transforms")
+        if len(loop_constraints) == 0 and not position_constraints:
+            print("Warning: No constraints provided, returning original transforms")
             return sequential_transforms
+
+        # Pre-convert position constraints to tensors
+        if position_constraints:
+            k_pos = torch.tensor(
+                [k for k, _ in position_constraints], dtype=torch.long, device=self.device
+            )
+            p_tgt = torch.tensor(
+                np.array([p for _, p in position_constraints], dtype=np.float64),
+                dtype=torch.float32,
+                device=self.device,
+            )  # (M, 3)
+        else:
+            k_pos = None
+            p_tgt = None
 
         Ginv = pp.Sim3(input_poses).Inv().Log()
         lmbda = lambda_init
         residual_history = []
 
         print(
-            f"Starting optimization with {len(sequential_transforms)} poses \
-                and {len(loop_constraints)} loop constraints"
+            f"Starting optimization with {len(sequential_transforms)} poses, "
+            f"{len(loop_constraints)} loop constraints"
+            + (f", {len(position_constraints)} position constraints" if position_constraints else "")
             + (f" [T0 pinned]" if t0_prior is not None else "")
         )
 
@@ -261,21 +280,50 @@ class Sim3LoopOptimizer:
                 Ginv, input_poses, dSloop, ii_loop, jj_loop, jacobian=True
             )
 
-            if resid.numel() == 0:
+            if resid.numel() == 0 and k_pos is None:
                 print("No residuals to optimize")
                 break
 
-            current_cost = resid.square().mean().item()
+            seq_cost = resid.square().mean().item() if resid.numel() > 0 else 0.0
+
+            # Compute position residuals and Jacobians via autograd
+            if k_pos is not None:
+                with torch.enable_grad():
+                    g_k = Ginv[k_pos].detach().requires_grad_(True)
+
+                    def _pos_translation(g):
+                        return pp.Exp(g).Inv().translation()  # (M, 3)
+
+                    t_k = _pos_translation(g_k)
+                    pos_r = t_k - p_tgt  # (M, 3)
+
+                    # Jacobian of translation w.r.t. g: (3, M, 7) -> permute -> (M, 3, 7)
+                    J_pos_raw = torch.autograd.functional.jacobian(
+                        lambda g: _pos_translation(g).sum(0), g_k, vectorize=True
+                    )
+                    J_pos = J_pos_raw.permute(1, 0, 2).detach()  # (M, 3, 7)
+                    pos_r = pos_r.detach()
+
+                pos_cost = pos_r.square().mean().item()
+            else:
+                pos_r = None
+                J_pos = None
+                pos_cost = 0.0
+
+            current_cost = seq_cost + pos_cost
             residual_history.append(current_cost)
 
             try:  # Solve linear system
                 begin_time = time.time()
-                if self.solve_system_version == "cpp":
-                    (delta_pose,) = sim3solve.solve_system(
-                        J_Ginv_i, J_Ginv_j, iii, jjj, resid, 0.0, lmbda, -1
-                    )
-                elif self.solve_system_version == "python":
+                # Force Python solver when position constraints are active (cpp path lacks support)
+                use_python = (self.solve_system_version == "python") or (k_pos is not None)
+                if use_python:
                     delta_pose = solve_system_py(
+                        J_Ginv_i, J_Ginv_j, iii, jjj, resid, 0.0, lmbda, -1,
+                        J_pos=J_pos, k_pos=k_pos, resid_pos=pos_r,
+                    )
+                elif self.solve_system_version == "cpp":
+                    (delta_pose,) = sim3solve.solve_system(
                         J_Ginv_i, J_Ginv_j, iii, jjj, resid, 0.0, lmbda, -1
                     )
                 else:
@@ -293,7 +341,16 @@ class Sim3LoopOptimizer:
             Ginv_tmp = Ginv + delta_pose
 
             new_resid = self.residual(Ginv_tmp, input_poses, dSloop, ii_loop, jj_loop)
-            new_cost = new_resid.square().mean().item() if new_resid.numel() > 0 else float("inf")
+            new_seq_cost = new_resid.square().mean().item() if new_resid.numel() > 0 else 0.0
+            if k_pos is not None:
+                with torch.no_grad():
+                    pos_r_new = pp.Exp(Ginv_tmp[k_pos]).Inv().translation() - p_tgt
+                new_pos_cost = pos_r_new.square().mean().item()
+            else:
+                new_pos_cost = 0.0
+            new_cost = new_seq_cost + new_pos_cost
+
+            solver_label = "python" if use_python else self.solve_system_version
 
             # L-M
             if new_cost < current_cost:
@@ -311,7 +368,7 @@ class Sim3LoopOptimizer:
                 )  # more readible to accepted
 
             print(
-                f"Time of solver ({self.solve_system_version}): \
+                f"Time of solver ({solver_label}): \
                     {(end_time - begin_time)*1000:.4f} ms"
             )
 

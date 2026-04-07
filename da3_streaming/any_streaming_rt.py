@@ -152,7 +152,6 @@ class Any_StreamingRT:
             gps_rows = read_gps_csv(gps_csv)
             self.gps_interp, self.gps_meta = build_enu_interpolator(gps_rows)
             print(f"GPS loaded: {len(gps_rows)} samples")
-        self.gps_t0_correction = np.zeros(3, dtype=np.float32)  # model-frame shift: pred[0] → GT[0]
         self._kitti_poses_cache: np.ndarray | None = None        # loaded once, reused every chunk
         self.acc_cam_positions: list = []   # list of [K,3] arrays, non-overlap camera positions
         self.frame_image_paths: list = []   # parallel to acc_cam_positions (flattened)
@@ -535,10 +534,6 @@ class Any_StreamingRT:
                 s_abs, R_abs, t_abs = cumulative[i - 1]
                 new_c2w.append(self._apply_sim3_to_c2w(c2w_local, s_abs, R_abs, t_abs))
         self.acc_frame_c2w = new_c2w
-        # Re-apply GPS start anchor (wiped by the model-frame rebuild above)
-        if np.linalg.norm(self.gps_t0_correction) > 1e-4:
-            for c2w_chunk in self.acc_frame_c2w:
-                c2w_chunk[:, :3, 3] += self.gps_t0_correction
 
     def _retransform_pointcloud(self):
         """Retransform acc_pts from pre-PGO chunk transforms to post-PGO ones.
@@ -625,35 +620,119 @@ class Any_StreamingRT:
                 [gt_model], colors=[[0, 255, 0]],
             ), static=True)
 
-    def _run_gps_pgo(self, kitti_poses_path: str):
-        """GPS-based Pose Graph Optimization using absolute anchor constraints.
+    def _shift_all_poses(self, delta: np.ndarray):
+        """Rigidly shift acc_cam_positions, acc_frame_c2w, and acc_pts by delta (3,).
 
-        Each GPS constraint anchors chunk k to its GT position expressed in model frame:
-          constraint (0, k, S_k)  where S_k = T_global^{-1} ∘ T_k_gt
+        Used to move the model origin to the GPS start position before PGO, so that
+        pred and GPS share the same starting point in all visualisations.
+        sim3_list is NOT touched — relative transforms are invariant to global translation.
+        """
+        delta32 = delta.astype(np.float32)
+        for cam_pos in self.acc_cam_positions:
+            cam_pos += delta32
+        for c2w_chunk in self.acc_frame_c2w:
+            c2w_chunk[:, :3, 3] += delta32
+        self.acc_pts = [p + delta32 for p in self.acc_pts]
 
-        Since T_0 = Identity, pairwise (0, k, S_k) is equivalent to setting the
-        absolute pose of node k. The optimizer adjusts sequential transforms to satisfy
-        all anchors simultaneously.
+    def _log_gps_traj_rerun(self, s_g: float, R_g: np.ndarray, t_g: np.ndarray):
+        """Log GPS CSV trajectory (ENU → model frame) as a static green line."""
+        gps_enu = []
+        for path in self.frame_image_paths:
+            ts = extract_ts_ns(path)
+            if ts is None:
+                continue
+            e, n, u = self.gps_interp(ts)
+            if np.isfinite(e) and np.isfinite(n) and np.isfinite(u):
+                gps_enu.append([float(e), float(n), float(u)])
+        if len(gps_enu) < 2:
+            return
+        gps_enu = np.array(gps_enu, dtype=np.float64)
+        gt_model = ((1.0 / s_g) * ((gps_enu - t_g) @ R_g)).astype(np.float32)
+        rr.log("trajectories/gt", rr.Points3D(
+            positions=gt_model,
+            colors=np.full((len(gt_model), 3), [0, 255, 0], dtype=np.uint8),
+        ), static=True)
+        if len(gt_model) >= 2:
+            rr.log("trajectories/gt_line", rr.LineStrips3D(
+                [gt_model], colors=[[0, 255, 0]],
+            ), static=True)
+
+    def _fit_gps_csv_alignment(self):
+        """Compute Umeyama alignment from predicted chunk positions to GPS CSV ENU.
+
+        Returns (s_g, R_g, t_g, chunk_gt_pos, chunk_gt_rot, pred_pos, pred_scales)
+        with the same layout as _fit_gt_alignment.  chunk_gt_rot is identity (GPS has
+        no orientation); chunk_gt_pos[k] is NaN if GPS is unavailable for that chunk.
+        Returns None if fewer than 3 valid GPS observations exist.
+        """
+        n_chunks_total = len(self.chunk_indices)
+        n_chunks = min(n_chunks_total, len(self.sim3_list) + 1)
+
+        # Build global_frame_index → image_path mapping from accumulated lists
+        gfi_to_path = {
+            gfi: self.frame_image_paths[i]
+            for i, gfi in enumerate(self.acc_frame_global_indices)
+        }
+
+        chunk_gt_pos = np.full((n_chunks, 3), np.nan, dtype=np.float64)
+        chunk_gt_rot = np.tile(np.eye(3, dtype=np.float64), (n_chunks, 1, 1))
+
+        for ci, (start, end) in enumerate(self.chunk_indices[:n_chunks]):
+            ov = self.overlap
+            rep = (start + (end - ov - start) // 2) if ci == 0 else \
+                  ((start + ov) + (end - start - ov) // 2)
+            path = gfi_to_path.get(rep)
+            if path is None:
+                continue
+            ts = extract_ts_ns(path)
+            if ts is None:
+                continue
+            e, n, u = self.gps_interp(ts)
+            if np.isfinite(e) and np.isfinite(n) and np.isfinite(u):
+                chunk_gt_pos[ci] = [float(e), float(n), float(u)]
+
+        cumulative = accumulate_sim3_transforms(self.sim3_list) if self.sim3_list else []
+        pred_positions = [np.zeros(3, dtype=np.float64)]
+        pred_scales    = [1.0]
+        for (s_c, R_c, t_c) in cumulative[:n_chunks - 1]:
+            pred_positions.append(t_c.astype(np.float64))
+            pred_scales.append(float(s_c))
+        pred_pos    = np.array(pred_positions[:n_chunks])
+        pred_scales = pred_scales[:n_chunks]
+
+        valid = np.all(np.isfinite(chunk_gt_pos), axis=1)
+        n_valid = int(valid.sum())
+        print(f"  [GPS-CSV] {n_valid}/{n_chunks} chunks have valid GPS positions")
+        if n_valid < 3:
+            print("  [GPS-CSV] Not enough valid GPS points for Umeyama fit. Skipping PGO.")
+            return None
+
+        s_g, R_g, t_g = umeyama_alignment(pred_pos[valid], chunk_gt_pos[valid], with_scale=True)
+        print(f"  [GPS-CSV] Umeyama: scale={s_g:.4f}  "
+              f"|R_g-I|={np.linalg.norm(R_g - np.eye(3)):.4f}  "
+              f"|t_g|={np.linalg.norm(t_g):.3f}m")
+        return s_g, R_g, t_g, chunk_gt_pos, chunk_gt_rot, pred_pos, pred_scales
+
+    def _run_gps_pgo(self, alignment_data: tuple, kitti_poses=None):
+        """GPS-based Pose Graph Optimization using position-only anchor constraints.
+
+        Constrains only the translation of each anchored chunk; rotation and scale
+        are governed solely by the sequential (odometry) edges and remain free.
+
+        alignment_data: 7-tuple returned by _fit_gt_alignment or _fit_gps_csv_alignment:
+          (s_g, R_g, t_g, chunk_gt_pos, chunk_gt_rot, pred_pos, pred_scales)
+        kitti_poses: if provided, GT trajectory is logged to Rerun after PGO.
 
         Umeyama: s_g * R_g @ pred + t_g ≈ gt  maps model frame → GPS (metric) frame.
         Inverse: pos_model = (1/s_g) * R_g.T @ (pos_gps - t_g)
-
-        S_k components in model frame:
-          R_k = R_g.T @ R_k_gt
-          t_k = (1/s_g) * R_g.T @ (t_k_gt - t_g)
-          s_k = pred_scales[k]   (keep accumulated model scale, avoids scale conflict)
-
-        Why use original model-frame sim3_list?
-          Sequential transforms S_{k,k+1} = T_k^{-1} ∘ T_{k+1} are invariant to any
-          global frame change: (T_g∘T_k)^{-1}∘(T_g∘T_{k+1}) = T_k^{-1}∘T_{k+1}.
-          There is no "aligned sim3_list" — it's the same list. The GPS constraints
-          encode the alignment inside themselves; no preprocessing of sim3_list needed.
         """
         from loop_utils.sim3loop import Sim3LoopOptimizer
 
         print("\n=== GPS-PGO ===")
-        kitti_poses = load_kitti_poses(kitti_poses_path)
-        print(f"Loaded {len(kitti_poses)} GT poses from {kitti_poses_path}")
+        s_g, R_g, t_g, chunk_gt_pos, chunk_gt_rot, pred_pos, pred_scales = alignment_data
+        print(f"  [GPS-PGO] Umeyama: scale={s_g:.4f}  "
+              f"|R_g-I|={np.linalg.norm(R_g - np.eye(3)):.4f}  "
+              f"|t_g|={np.linalg.norm(t_g):.3f}m")
 
         if not self.sim3_list:
             print("  sim3_list empty (single chunk). Skipping PGO.")
@@ -663,49 +742,62 @@ class Any_StreamingRT:
         pgo_cfg = self.config.get("GPS_PGO", {})
         gps_every_k = pgo_cfg.get("gps_every_k", 5)
 
-        # ── Umeyama alignment + chunk GT ──────────────────────────────────────
-        s_g, R_g, t_g, chunk_gt_pos, chunk_gt_rot, pred_pos, pred_scales = \
-            self._fit_gt_alignment(kitti_poses)
-        print(f"  [GPS-PGO] Umeyama: scale={s_g:.4f}  "
-              f"|R_g-I|={np.linalg.norm(R_g - np.eye(3)):.4f}  "
-              f"|t_g|={np.linalg.norm(t_g):.3f}m")
+        # ── Pre-shift: move pred frame 0 to GT/GPS frame 0 in model coords ──────
+        # acc_cam_positions[0][0] is the first displayed camera position — the actual
+        # chunk-0 local coordinate of frame 0 (not [0,0,0] in general).
+        # gt_line logs kitti_poses[first_gfi] (or GPS at ts_of_frame_0) in model frame.
+        # We compute the shift that makes these identical, so pgo_line[0] == gt_line[0].
+        # sim3_list (relative transforms) is invariant to this global translation shift.
+        pred_frame0 = self.acc_cam_positions[0][0].astype(np.float64)
+        first_gfi = self.acc_frame_global_indices[0]
 
-        # ── GPS start prior: pin T_0 to its GPS-derived position in model frame ─
-        # Use full-trajectory Umeyama (all chunks now available) for best estimate.
-        t0_anchor = ((1.0 / s_g) * (R_g.T @ (chunk_gt_pos[0] - t_g))).astype(np.float32)
-        t0_prior = (float(pred_scales[0]),
-                    (R_g.T @ chunk_gt_rot[0]).astype(np.float32),
-                    t0_anchor)
-        self.gps_t0_correction = t0_anchor
-        print(f"  [GPS-PGO] T0 prior: |t0_anchor|={np.linalg.norm(t0_anchor):.4f}m")
+        if kitti_poses is not None:
+            gt_pos_first = kitti_poses[first_gfi, :3, 3]
+        elif self.gps_interp is not None:
+            path = self.frame_image_paths[0]
+            ts = extract_ts_ns(path)
+            e, n, u = self.gps_interp(ts)
+            gt_pos_first = np.array([float(e), float(n), float(u)]) \
+                if np.all(np.isfinite([e, n, u])) else None
+        else:
+            gt_pos_first = None
 
-        # ── build absolute anchor constraints: (0, k, S_k) ───────────────────
-        # S_k = T_global^{-1} ∘ T_k_gt expressed in model frame
-        def _abs_constraint(k):
-            # T_k_desired in model frame:
-            #   R = R_g.T @ R_k_gt  (GPS rotation → model frame)
-            #   t = (1/s_g) * R_g.T @ (t_k_gt - t_g)  (GPS position → model scale)
-            #   s = pred_scales[k]  (keep accumulated model scale)
-            # Convention: (i, j, S) makes T_j = T_i @ S^{-1}.
-            # We want T_k = T_k_desired when T_0 ≈ Identity.
-            # (k, 0, T_k_desired) → T_0 = T_k @ T_k_desired^{-1} ≈ Identity → T_k ≈ T_k_desired ✓
-            R_k = R_g.T @ chunk_gt_rot[k]
+        if gt_pos_first is not None and np.all(np.isfinite(gt_pos_first)):
+            gt_frame0_model = (1.0 / s_g) * (R_g.T @ (gt_pos_first - t_g))
+            p0_model = gt_frame0_model - pred_frame0
+            self._shift_all_poses(p0_model)
+            print(f"  [GPS-PGO] Pre-shift pred[0]→GT[0]: |shift|={np.linalg.norm(p0_model):.4f}m")
+        else:
+            p0_model = np.zeros(3)
+            print("  [GPS-PGO] No GT/GPS for first frame; skipping origin pre-shift")
+
+        # ── Build position-only constraints from k=0: (k, t_k_model) ─────────
+        # t_k_model = (1/s_g) * R_g.T @ (chunk_gt_pos[k] - t_g)
+        # Constrains translation of chunk k only; rotation/scale left free.
+        # k=0 is included: after the pre-shift, its initial residual is ~0,
+        # and the constraint keeps it anchored at the GPS start throughout.
+        def _abs_pos_constraint(k):
             t_k = (1.0 / s_g) * (R_g.T @ (chunk_gt_pos[k] - t_g))
-            s_k = float(pred_scales[k])
-            return (k, 0, (s_k, R_k.astype(np.float32), t_k.astype(np.float32)))
+            return (k, t_k.astype(np.float64))
 
-        constraints = []
-        for k in range(1, n_chunks, gps_every_k):
-            constraints.append(_abs_constraint(k))
-        print(f"  [GPS-PGO] {len(constraints)} absolute anchor constraints "
-              f"(every {gps_every_k} chunks, {n_chunks} total)")
-        if not constraints:
+        position_constraints = []
+        for k in range(0, n_chunks, gps_every_k):
+            if not np.all(np.isfinite(chunk_gt_pos[k])):
+                print(f"  [GPS-PGO] Skipping chunk {k}: no valid GPS position")
+                continue
+            position_constraints.append(_abs_pos_constraint(k))
+        print(f"  [GPS-PGO] {len(position_constraints)} position-only constraints "
+              f"(every {gps_every_k} chunks, {n_chunks} total, starting at k=0)")
+        if not position_constraints:
             print("  No GPS constraints generated. Skipping PGO.")
             return
 
         # ── PGO on original model-frame sim3_list ─────────────────────────────
         optimizer = Sim3LoopOptimizer(self.config, device="cpu")
-        optimized_sim3 = optimizer.optimize(self.sim3_list, constraints, t0_prior=t0_prior)
+        optimized_sim3 = optimizer.optimize(
+            self.sim3_list, [],
+            position_constraints=position_constraints,
+        )
         self.sim3_list = optimized_sim3
 
         # ── recompute per-frame poses from optimized sim3_list ────────────────
@@ -723,22 +815,17 @@ class Any_StreamingRT:
                     (s_abs * (pos @ R_abs.T) + t_abs).astype(np.float32)
                 )
         self.acc_cam_positions = new_cam_positions
-        # Re-apply GPS start anchor to cam positions (wiped by the model-frame rebuild above)
-        if np.linalg.norm(self.gps_t0_correction) > 1e-4:
-            for cam_pos in self.acc_cam_positions:
-                cam_pos += self.gps_t0_correction
-
+        # Retransform pointcloud first (rebuilds acc_pts in original model frame),
+        # then shift everything together so acc_pts, acc_cam_positions, acc_frame_c2w
+        # are all consistently shifted.
         self._retransform_pointcloud()
-        # Re-apply GPS start anchor after retransform
-        if np.linalg.norm(self.gps_t0_correction) > 1e-4:
-            delta = self.gps_t0_correction.astype(np.float32)
-            self.acc_pts = [p + delta for p in self.acc_pts]
+        self._shift_all_poses(p0_model)
 
         print("  GPS-PGO complete. Poses updated.\n")
 
-        # Log GT now that we have fresh Umeyama params (overwrites the one logged
-        # before PGO — same transform, but computed on updated pred positions)
-        self._log_gt_rerun(kitti_poses, s_g, R_g, t_g)
+        # Log GT trajectory after PGO (only when GT is available)
+        if kitti_poses is not None:
+            self._log_gt_rerun(kitti_poses, s_g, R_g, t_g)
 
     def _run_gps_anchor_warp(self, kitti_poses_path: str):
         """Stage-2 GPS correction: piecewise-linear trajectory deformation.
@@ -961,17 +1048,18 @@ class Any_StreamingRT:
                     [baseline_traj], colors=[[255, 220, 0]],
                 ))
 
-        # GT trajectory + optional GPS-PGO (if kitti_poses provided)
+        # GT trajectory + optional GPS-PGO
+        pgo_cfg = self.config.get("GPS_PGO", {})
+
         if self.kitti_poses_path is not None:
             _kitti_poses = load_kitti_poses(self.kitti_poses_path)
-            _s_g, _R_g, _t_g, *_ = self._fit_gt_alignment(_kitti_poses)
-            self._log_gt_rerun(_kitti_poses, _s_g, _R_g, _t_g)
+            _alignment = self._fit_gt_alignment(_kitti_poses)
+            self._log_gt_rerun(_kitti_poses, *_alignment[:3])
 
-            pgo_cfg = self.config.get("GPS_PGO", {})
             if pgo_cfg.get("enabled", False):
                 method = pgo_cfg.get("method", "anchor_warp")
                 if method == "pgo":
-                    self._run_gps_pgo(self.kitti_poses_path)
+                    self._run_gps_pgo(_alignment, kitti_poses=_kitti_poses)
                 else:
                     self._run_gps_anchor_warp(self.kitti_poses_path)
                 pgo_pose_path = os.path.join(self.output_dir, "poses_pred_pgo.txt")
@@ -1000,6 +1088,44 @@ class Any_StreamingRT:
                         all_pts  = all_pts[idx]
                         all_cols = all_cols[idx]
                     rr.log("map/pointcloud", rr.Points3D(positions=all_pts, colors=all_cols))
+
+        elif self.gps_interp is not None:
+            # GPS CSV: compute alignment (needed for GT log and optional PGO)
+            _alignment = self._fit_gps_csv_alignment() if self.sim3_list else None
+            if _alignment is not None:
+                self._log_gps_traj_rerun(*_alignment[:3])
+
+            if pgo_cfg.get("enabled", False):
+                if pgo_cfg.get("method", "anchor_warp") == "pgo":
+                    if _alignment is None:
+                        print("  [GPS-CSV] Alignment failed or sim3_list empty. Skipping PGO.")
+                    else:
+                        self._run_gps_pgo(_alignment)
+                        pgo_pose_path = os.path.join(self.output_dir, "poses_pred_pgo.txt")
+                        self._save_poses_kitti(pgo_pose_path)
+
+                        self._rr_time += 1
+                        rr.set_time("stable_time", sequence=self._rr_time)
+                        pgo_traj = np.concatenate(self.acc_cam_positions, axis=0).astype(np.float32)
+                        rr.log("trajectories/pgo", rr.Points3D(
+                            positions=pgo_traj,
+                            colors=np.full((len(pgo_traj), 3), [0, 220, 255], dtype=np.uint8),
+                        ))
+                        if len(pgo_traj) >= 2:
+                            rr.log("trajectories/pgo_line", rr.LineStrips3D(
+                                [pgo_traj], colors=[[0, 220, 255]],
+                            ))
+                        if self.acc_pts:
+                            all_pts  = np.concatenate(self.acc_pts,  axis=0)
+                            all_cols = np.concatenate(self.acc_cols, axis=0)
+                            max_pts = 3_000_000
+                            if len(all_pts) > max_pts:
+                                idx = np.random.choice(len(all_pts), size=max_pts, replace=False)
+                                all_pts  = all_pts[idx]
+                                all_cols = all_cols[idx]
+                            rr.log("map/pointcloud", rr.Points3D(positions=all_pts, colors=all_cols))
+                else:
+                    print("  [GPS-CSV] anchor_warp from GPS CSV not yet supported.")
 
         # Save final poses (post-PGO if run, otherwise same as baseline)
         final_pose_path = os.path.join(self.output_dir, "poses_pred.txt")
