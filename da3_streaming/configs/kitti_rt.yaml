@@ -54,5 +54,5 @@ Loop:
 GPS_PGO:
   enabled: true
   method: 'pgo'            # 'anchor_warp' (piecewise-linear, preserves local shape) or 'pgo' (joint factor graph)
-  gps_every_k: 5                   # anchor every k-th chunk to its GT pose (1 = every chunk)
+  gps_every_k: 1                   # anchor every k-th chunk to its GT pose (1 = every chunk)
   use_start_prior: false

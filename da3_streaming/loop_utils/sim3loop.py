@@ -21,6 +21,7 @@ import pypose as pp
 import torch
 from fastloop.solve_python import solve_system_py
 from scipy.spatial.transform import Rotation as R
+import gtsam
 
 cpp_version = False
 try:
@@ -72,6 +73,35 @@ class Sim3LoopOptimizer:
         s = data[7]
         R_mat = R.from_quat(q).as_matrix()
         return s, R_mat, t
+
+    @staticmethod
+    def _gtsam_pose3_from_rt(R_mat, t_vec):
+        """
+        Build a gtsam.Pose3 from a 3x3 rotation matrix and a 3-vector translation.
+        """
+        return gtsam.Pose3(gtsam.Rot3(R_mat), gtsam.Point3(*t_vec))
+
+    @staticmethod
+    def _rt_from_gtsam_pose3(pose):
+        """Extract (R: 3x3, t: 3,) numpy arrays from a gtsam.Pose3."""
+        R_mat = pose.rotation().matrix()
+        t_vec = np.asarray(pose.translation()) #.reshape(3)
+        return R_mat, t_vec
+    
+    @staticmethod
+    def _model_sim3_to_gps_pose3(s_model, R_model, t_model, s_g, R_g, t_g):
+        """
+        Apply the Umeyama similarity (s_g, R_g, t_g) to a model-frame Sim3 pose,
+        producing a GPS-frame (R, t) pair (scale absorbed into the metric translation).
+
+        Composition rule:
+            (s_g, R_g, t_g) ∘ (s_m, R_m, t_m)
+                = (s_g*s_m, R_g R_m, s_g R_g t_m + t_g)
+        """
+        R_gps = R_g @ R_model
+        t_gps = s_g * (R_g @ t_model) + t_g
+        return R_gps, t_gps
+
 
     def sequential_to_absolute_poses(
         self, sequential_transforms: List[Tuple[float, np.ndarray, np.ndarray]]
@@ -390,7 +420,101 @@ class Sim3LoopOptimizer:
 
         return optimized_sequential
 
+    def optimize_gps(
+        self,
+        sequential_transforms,
+        position_constraints, # list of (k, p_k_gps) in metric GPS frame. include chunk 0 to ANCHOR
+        umeyama,               # (s_g, R_g, t_g) model→GPS similarity 
+        max_iterations: int = None,
+        lambda_init: float = None,
+    ):
+        if max_iterations is None:
+            max_iterations = self.config["Loop"]["SIM3_Optimizer"]["max_iterations"]
+        if lambda_init is None:
+            lambda_init = eval(self.config["Loop"]["SIM3_Optimizer"]["lambda_init"])
+        
+        s_g, R_g, t_g = umeyama
 
+        # build init abs poses in model frame -> project to GPS
+        abs_poses_model = self.sequential_to_absolute_poses(sequential_transforms)
+        n_chunks = abs_poses_model.shape[0]
+
+        initial_R = []
+        initial_t = []
+
+        for k in range(n_chunks):
+            s_m, R_m, t_m = self.pypose_sim3_to_numpy(pp.Sim3(abs_poses_model[k])) # compose umeyama with the model sim3 (s_g * s_m → drop into Pose3 translation)
+            R_gps, t_gps = self._model_sim3_to_gps_pose3(s_m, R_m, t_m, s_g, R_g, t_g)
+            initial_R.append(R_gps)
+            initial_t.append(t_gps)
+
+        # graph + values + initial Pose3 insertion
+        graph = gtsam.NonlinearFactorGraph()
+        initial = gtsam.Values()
+        X = lambda k: gtsam.symbol('x', k)
+
+        for k in range(n_chunks):
+            initial.insert(X(k), self._gtsam_pose3_from_rt(initial_R[k], initial_t[k]))
+
+        # gps factors
+        if position_constraints:
+            gps_sigma_t = self.config["Loop"]["SIM3_Optimizer"].get("gps_sigma_t", 0.1)
+            fallback_noise = gtsam.noiseModel.Isotropic.Sigma(3, gps_sigma_t)
+
+            for k, p_k_gps, cov_k in position_constraints:
+                if cov_k is None:
+                    noise_k = fallback_noise
+                else:
+                    cov_k = np.asarray(cov_k, dtype=np.float64).reshape(3, 3)
+                    # Defensive PD guards: degenerate altitude variance + jitter.
+                    if cov_k[2, 2] < 1e-9:
+                        cov_k[2, 2] = 100.0 * max(cov_k[0, 0], cov_k[1, 1], 1e-6)
+                    cov_k = cov_k + 1e-9 * np.eye(3)
+                    noise_k = gtsam.noiseModel.Gaussian.Covariance(cov_k)
+
+                graph.add(gtsam.GPSFactor(
+                    X(k),
+                    np.asarray(p_k_gps, dtype=np.float64),
+                    noise_k,
+                ))
+
+        # between factors
+        seq_sigma = self.config["Loop"]["SIM3_Optimizer"].get("seq_sigma", 0.01) #TODO: Tune these params
+        seq_noise = gtsam.noiseModel.Isotropic.Sigma(6, seq_sigma)
+        for k in range(n_chunks - 1):
+            T_k = initial.atPose3(X(k))
+            T_kp1 = initial.atPose3(X(k+1))
+            S_kl = T_k.between(T_kp1)
+            graph.add(gtsam.BetweenFactorPose3(X(k), X(k+1), S_kl, seq_noise))
+            
+        # optim loop
+        params = gtsam.LevenbergMarquardtParams()
+        params.setMaxIterations(max_iterations)
+        params.setlambdaInitial(lambda_init)
+        # params.setVerbosityLM("SUMMARY")
+
+        lm = gtsam.LevenbergMarquardtOptimizer(graph, initial, params)
+        result = lm.optimize()
+
+        # Return per-chunk ABSOLUTE GPS-frame Sim3s as plain numpy tuples.
+        # The chunk's metric scale is OUTSIDE the Pose3: it lives in s_g * s_k^m,
+        # where s_k^m is the depth-model per-chunk scale from _align_chunks. PGO
+        # cannot touch it (Pose3 has no scale handle), so we pull it back out of
+        # the input absolutes and bake (s_g * s_k^m) into the returned tuple.
+        # The caller is responsible for using these to render acc_* in GPS frame.
+        optimised_abs_gps = []
+        for k in range(n_chunks):
+            pose_gps = result.atPose3(X(k))
+            R_gps, t_gps = self._rt_from_gtsam_pose3(pose_gps)
+
+            s_model_k, _, _ = self.pypose_sim3_to_numpy(pp.Sim3(abs_poses_model[k]))
+            s_k_gps = float(s_g) * float(s_model_k)
+
+            optimised_abs_gps.append((s_k_gps, R_gps, t_gps))
+
+        return optimised_abs_gps
+
+        
 # ======== TEST CODE ========
 
 
