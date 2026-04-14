@@ -50,6 +50,11 @@ Loop:
     lang_version: 'python'
     max_iterations: 30
     lambda_init: 1e-6
+    # FLIPPED A/B: GPS tight, sequential loose.
+    gps_sigma_t: 0.01    # GPS unary fallback sigma (m) — was 0.1
+    seq_sigma: 0.1       # BetweenFactorPose3 isotropic sigma — was 0.01
+    # seq_sigma_R: 0.01  # (diagonal variant — currently commented out in sim3loop.py)
+    # seq_sigma_t: 0.05
 
 GPS_PGO:
   enabled: true

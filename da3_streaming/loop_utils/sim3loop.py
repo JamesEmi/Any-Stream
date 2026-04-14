@@ -479,8 +479,16 @@ class Sim3LoopOptimizer:
                 ))
 
         # between factors
-        seq_sigma = self.config["Loop"]["SIM3_Optimizer"].get("seq_sigma", 0.01) #TODO: Tune these params
+        seq_sigma = self.config["Loop"]["SIM3_Optimizer"].get("seq_sigma", 0.01)
         seq_noise = gtsam.noiseModel.Isotropic.Sigma(6, seq_sigma)
+        # --- diagonal variant (commented out for now while we A/B isotropic sigmas) ---
+        # seq_sigma_cfg = self.config["Loop"]["SIM3_Optimizer"]
+        # seq_sigma_R = seq_sigma_cfg.get("seq_sigma_R", 0.01)  # rad
+        # seq_sigma_t = seq_sigma_cfg.get("seq_sigma_t", 0.05)  # m
+        # seq_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([
+        #     seq_sigma_R, seq_sigma_R, seq_sigma_R,
+        #     seq_sigma_t, seq_sigma_t, seq_sigma_t,
+        # ], dtype=np.float64))
         for k in range(n_chunks - 1):
             T_k = initial.atPose3(X(k))
             T_kp1 = initial.atPose3(X(k+1))
@@ -494,7 +502,12 @@ class Sim3LoopOptimizer:
         # params.setVerbosityLM("SUMMARY")
 
         lm = gtsam.LevenbergMarquardtOptimizer(graph, initial, params)
+        initial_error = lm.error()
         result = lm.optimize()
+        final_error = lm.error()
+        iterations = lm.iterations()
+        print(f"  [GPS-PGO] LM: initial error={initial_error:.6f}  "
+              f"final error={final_error:.6f}  iterations={iterations}")
 
         # Return per-chunk ABSOLUTE GPS-frame Sim3s as plain numpy tuples.
         # The chunk's metric scale is OUTSIDE the Pose3: it lives in s_g * s_k^m,

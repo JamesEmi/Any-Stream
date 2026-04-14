@@ -19,6 +19,7 @@ import gc
 import glob
 import json
 import os
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -629,7 +630,8 @@ class Any_StreamingRT:
         self._acc_chunk_sim3 = new_chunk_sim3
 
     def _log_gt_rerun_gps_frame(self, kitti_poses: np.ndarray):
-        """Log GT trajectory directly in GPS frame (no Umeyama inverse).
+        """
+        Log GT trajectory directly in GPS frame (no Umeyama inverse).
 
         Used after GPS-PGO when acc_* already lives in GPS frame.
         """
@@ -643,6 +645,50 @@ class Any_StreamingRT:
             rr.log("trajectories/gt_line", rr.LineStrips3D(
                 [gt_pos_all], colors=[[0, 255, 0]],
             ), static=True)
+
+    def _log_gps_anchors_rerun(self, anchor_positions: np.ndarray):
+        """
+        Log per-chunk GPS anchor positions used as PGO unaries (red markers).
+
+        anchor_positions: [K, 3] array of GPS-frame positions, one per
+        anchored chunk. NaN rows are filtered out.
+        """
+        if anchor_positions is None or len(anchor_positions) == 0:
+            return
+        valid = np.isfinite(anchor_positions).all(axis=1)
+        pts = anchor_positions[valid].astype(np.float32)
+        if len(pts) == 0:
+            return
+        rr.log("trajectories/gps_anchors", rr.Points3D(
+            positions=pts,
+            colors=np.full((len(pts), 3), [255, 0, 0], dtype=np.uint8),
+            radii=np.full(len(pts), 0.5, dtype=np.float32),
+        ), static=True)
+
+    def _log_gps_traj_rerun_gps_frame(self):
+        """Log GPS CSV trajectory (raw ENU) as a static green line.
+
+        Used after the GPS-frame refactor — no Umeyama inverse needed because
+        acc_* now lives in GPS frame too.
+        """
+        gps_enu = []
+        for path in self.frame_image_paths:
+            ts = extract_ts_ns(path)
+            if ts is None:
+                continue
+            e, n, u = self.gps_interp(ts)
+            if np.isfinite(e) and np.isfinite(n) and np.isfinite(u):
+                gps_enu.append([float(e), float(n), float(u)])
+        if len(gps_enu) < 2:
+            return
+        gps_enu = np.array(gps_enu, dtype=np.float32)
+        rr.log("trajectories/gt", rr.Points3D(
+            positions=gps_enu,
+            colors=np.full((len(gps_enu), 3), [0, 255, 0], dtype=np.uint8),
+        ), static=True)
+        rr.log("trajectories/gt_line", rr.LineStrips3D(
+            [gps_enu], colors=[[0, 255, 0]],
+        ), static=True)
 
     def _fit_gt_alignment(self, kitti_poses: np.ndarray):
         """Compute Umeyama alignment from predicted chunk positions to GT.
@@ -837,6 +883,13 @@ class Any_StreamingRT:
         if not position_constraints:
             print("  No GPS constraints generated. Skipping PGO.")
             return
+
+        # Log the GPS anchor positions as red markers so they're visible in
+        # Rerun alongside baseline (yellow), gt (green), and pgo (cyan).
+        anchor_pts = np.array(
+            [p for (_, p, _) in position_constraints], dtype=np.float64
+        )
+        self._log_gps_anchors_rerun(anchor_pts)
 
         # ── PGO returns per-chunk absolute GPS-frame Sim3s ─────────────────────
         # NOTE: self.sim3_list is intentionally NOT updated. It stays as the
@@ -1066,10 +1119,26 @@ class Any_StreamingRT:
         baseline_pose_path = os.path.join(self.output_dir, "poses_pred_baseline.txt")
         self._save_poses_kitti(baseline_pose_path)
 
-        # Log baseline trajectory to Rerun (yellow, timestep N)
+        # ── Pre-compute Umeyama alignment so the baseline trajectory can be
+        # logged in GPS frame, matching the post-PGO cyan line and the GT.
+        pgo_cfg = self.config.get("GPS_PGO", {})
+        _kitti_poses = None
+        _alignment = None
+        if self.kitti_poses_path is not None:
+            _kitti_poses = load_kitti_poses(self.kitti_poses_path)
+            _alignment = self._fit_gt_alignment(_kitti_poses)
+        elif self.gps_interp is not None and self.sim3_list:
+            _alignment = self._fit_gps_csv_alignment()
+
+        # Log baseline trajectory to Rerun (yellow, timestep N) — in GPS frame
+        # if we have an alignment, otherwise in model frame as a fallback.
         if self.acc_cam_positions:
             rr.set_time("stable_time", sequence=self._rr_time)
-            baseline_traj = np.concatenate(self.acc_cam_positions, axis=0).astype(np.float32)
+            baseline_traj = np.concatenate(self.acc_cam_positions, axis=0).astype(np.float64)
+            if _alignment is not None:
+                s_g, R_g, t_g = _alignment[:3]
+                baseline_traj = (s_g * (baseline_traj @ R_g.T) + t_g)
+            baseline_traj = baseline_traj.astype(np.float32)
             rr.log("trajectories/baseline", rr.Points3D(
                 positions=baseline_traj,
                 colors=np.full((len(baseline_traj), 3), [255, 220, 0], dtype=np.uint8),
@@ -1080,12 +1149,9 @@ class Any_StreamingRT:
                 ))
 
         # GT trajectory + optional GPS-PGO
-        pgo_cfg = self.config.get("GPS_PGO", {})
-
         if self.kitti_poses_path is not None:
-            _kitti_poses = load_kitti_poses(self.kitti_poses_path)
-            _alignment = self._fit_gt_alignment(_kitti_poses)
-            self._log_gt_rerun(_kitti_poses, *_alignment[:3])
+            # GT in GPS frame (raw KITTI poses, no projection).
+            self._log_gt_rerun_gps_frame(_kitti_poses)
 
             if pgo_cfg.get("enabled", False):
                 method = pgo_cfg.get("method", "anchor_warp")
@@ -1121,10 +1187,9 @@ class Any_StreamingRT:
                     rr.log("map/pointcloud", rr.Points3D(positions=all_pts, colors=all_cols))
 
         elif self.gps_interp is not None:
-            # GPS CSV: compute alignment (needed for GT log and optional PGO)
-            _alignment = self._fit_gps_csv_alignment() if self.sim3_list else None
+            # _alignment was already fit above (so we could project the baseline).
             if _alignment is not None:
-                self._log_gps_traj_rerun(*_alignment[:3])
+                self._log_gps_traj_rerun_gps_frame()
 
             if pgo_cfg.get("enabled", False):
                 if pgo_cfg.get("method", "anchor_warp") == "pgo":
@@ -1246,6 +1311,14 @@ if __name__ == "__main__":
             "./exps", os.path.basename(args.image_dir.rstrip("/")), ts
         )
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Snapshot the config used for this run
+    try:
+        cfg_dst = os.path.join(args.output_dir, os.path.basename(args.config))
+        shutil.copy2(args.config, cfg_dst)
+        print(f"Copied config → {cfg_dst}")
+    except Exception as e:
+        print(f"  [warn] failed to copy config to output dir: {e}")
 
     # Rerun — mirrors demo_streaming_inference.py lines 441-443
     rr.script_setup(args, "da3_streaming_rt")
