@@ -1080,15 +1080,24 @@ class Any_StreamingRT:
 
             self._log_to_rerun()
 
-            # Log current frame image to Rerun
+            # Per-frame image + depth + confidence, on a dedicated "frame_idx"
+            # timeline so each frame is scrubbable independently of the
+            # per-chunk "stable_time" timeline used for trajectories/pointcloud.
+            # frame_paths/global_indices cover only non-overlap frames; sl
+            # slices cur_pred.{depth,conf} to match.
             if frame_paths:
                 try:
                     from PIL import Image as PILImage
-                    img = PILImage.open(frame_paths[-1]).convert("RGB")
-                    rr.set_time("stable_time", sequence=self._rr_time - 1)
-                    rr.log("camera/image", rr.Image(np.array(img)))
+                    depth_np = np.asarray(cur_pred.depth[sl])   # [K, H, W]
+                    conf_np  = np.asarray(cur_pred.conf[sl])    # [K, H, W]
+                    for local_i, (fp, gfi) in enumerate(zip(frame_paths, global_indices)):
+                        rr.set_time("frame_idx", sequence=int(gfi))
+                        img = PILImage.open(fp).convert("RGB")
+                        rr.log("camera/image", rr.Image(np.array(img)))
+                        rr.log("camera/depth", rr.DepthImage(depth_np[local_i].astype(np.float32)))
+                        rr.log("camera/conf",  rr.DepthImage(conf_np[local_i].astype(np.float32)))
                 except Exception as e:
-                    print(f"  [rerun] image log failed: {e}")
+                    print(f"  [rerun] per-frame log failed: {e}")
 
             # GPS alignment (optional)
             gps_result = self._compute_gps_alignment()
@@ -1219,7 +1228,9 @@ class Any_StreamingRT:
                                 idx = np.random.choice(len(all_pts), size=max_pts, replace=False)
                                 all_pts  = all_pts[idx]
                                 all_cols = all_cols[idx]
-                            rr.log("map/pointcloud", rr.Points3D(positions=all_pts, colors=all_cols))
+                            # After PGO, acc_pts lives in GPS frame — log there
+                            rr.log("map/global_pointcloud",
+                                   rr.Points3D(positions=all_pts, colors=all_cols))
                 else:
                     print("  [GPS-CSV] anchor_warp from GPS CSV not yet supported.")
 
