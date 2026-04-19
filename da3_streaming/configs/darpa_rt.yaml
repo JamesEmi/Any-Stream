@@ -34,7 +34,7 @@ Model:
 
   Pointcloud_Save:
     sample_ratio: 0.015
-    conf_threshold_coef: 0.75
+    conf_threshold_coef: 1.2 #0.75
     use_conf_filtering: True
 
 Loop:
@@ -50,9 +50,16 @@ Loop:
     lang_version: 'python'
     max_iterations: 30
     lambda_init: 1e-6
+    gps_sigma_t: 0.01    # GPS unary fallback sigma (m) — was 0.1
+    seq_sigma: 0.1       # BetweenFactorPose3 isotropic sigma — was 0.01
+    heading_sigma: 0.1
+    scale_bw_sigma: 0.05
+    scale_prior_sigma: 0.0
 
 GPS_PGO:
   enabled: true
   method: 'pgo'            # 'anchor_warp' (piecewise-linear, preserves local shape) or 'pgo' (joint factor graph)
-  gps_every_k: 1                   # anchor every k-th chunk to its GT pose (1 = every chunk)
+  # gps_every_k: 1                   # anchor every k-th chunk to its GT pose (1 = every chunk)
+  gps_anchor_freq: 1         # gps samples anchored every N frames!
+  gps_cov_isotropic: true    # true → ignore sensor cov, use gps_sigma_t as isotropic σ
   use_start_prior: false

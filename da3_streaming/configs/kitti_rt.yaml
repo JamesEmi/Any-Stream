@@ -50,14 +50,21 @@ Loop:
     lang_version: 'python'
     max_iterations: 30
     lambda_init: 1e-6
-    # FLIPPED A/B: GPS tight, sequential loose.
-    gps_sigma_t: 0.01    # GPS unary fallback sigma (m) — was 0.1
-    seq_sigma: 0.1       # BetweenFactorPose3 isotropic sigma — was 0.01
-    # seq_sigma_R: 0.01  # (diagonal variant — currently commented out in sim3loop.py)
-    # seq_sigma_t: 0.05
+    gps_sigma_t: 0.01    # GPS unary fallback sigma (m)
+    # seq_sigma controls BetweenFactorSim3 rot/trans as a joint isotropic fallback.
+    # seq_sigma_R / seq_sigma_t override it when set. Use the split to weld rotation
+    # to VO (tight seq_sigma_R) while keeping translation loose enough that per-chunk
+    # GPS position factors can still pull chunks into place.
+    seq_sigma: 0.03           # fallback if _R/_t not set
+    seq_sigma_R: 1.0e-4       # rotation: weld to VO relatives (target: ROE → pure-VO ~1°)
+    seq_sigma_t: 0.05         # translation: loose enough for GPS-driven per-chunk placement
+    heading_sigma: 0.3
+    scale_bw_sigma: 0.05
+    scale_prior_sigma: 0.0
 
 GPS_PGO:
   enabled: true
   method: 'pgo'            # 'anchor_warp' (piecewise-linear, preserves local shape) or 'pgo' (joint factor graph)
-  gps_every_k: 1                   # anchor every k-th chunk to its GT pose (1 = every chunk)
+  # gps_every_k: 1                   # anchor every k-th chunk to its GT pose - old Pose3 path
+  gps_anchor_freq: 1         # gps samples anchored every N frames!
   use_start_prior: false

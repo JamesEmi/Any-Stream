@@ -46,6 +46,7 @@ class GpsSample:
     lat: float
     lon: float
     alt: float
+    cov_enu: Optional[np.ndarray] = None  # 3x3 ENU covariance, or None if unavailable
 
 
 def read_gps_csv(csv_path: str) -> List[GpsSample]:
@@ -59,7 +60,14 @@ def read_gps_csv(csv_path: str) -> List[GpsSample]:
             lat = float(r["latitude"])
             lon = float(r["longitude"])
             alt = float(r["altitude"])
-            rows.append(GpsSample(t_ns=t_ns, t_s=t_s, lat=lat, lon=lon, alt=alt))
+            cov = None
+            if "cov_ee" in r:
+                cov = np.array([
+                    [float(r["cov_ee"]), float(r["cov_en"]), float(r["cov_eu"])],
+                    [float(r["cov_ne"]), float(r["cov_nn"]), float(r["cov_nu"])],
+                    [float(r["cov_ue"]), float(r["cov_un"]), float(r["cov_uu"])],
+                ], dtype=np.float64)
+            rows.append(GpsSample(t_ns=t_ns, t_s=t_s, lat=lat, lon=lon, alt=alt, cov_enu=cov))
     if not rows:
         raise ValueError(f"No rows parsed from {csv_path}")
     return rows
@@ -79,7 +87,12 @@ def extract_ts_ns(path: str) -> Optional[int]:
 
 
 def build_enu_interpolator(gps_rows: List[GpsSample]):
-    """Build an ENU interpolator from GPS samples."""
+    """Build an ENU interpolator from GPS samples.
+
+    Returns (interp, meta) where interp is an object with:
+      interp(ts_ns) → (e, n, u)
+      interp.covariance(ts_ns) → 3x3 ndarray or None (if CSV had no covariance)
+    """
     t_ns = np.array([g.t_ns for g in gps_rows], dtype=np.int64)
     order = np.argsort(t_ns)
     gps_sorted = [gps_rows[i] for i in order]
@@ -96,14 +109,28 @@ def build_enu_interpolator(gps_rows: List[GpsSample]):
     n_arr = np.asarray(n_list, dtype=np.float64)
     u_arr = np.asarray(u_list, dtype=np.float64)
 
-    def interp(ts_ns):
-        ts = np.asarray(ts_ns, dtype=np.int64)
-        e = np.interp(ts, t_ns, e_arr, left=np.nan, right=np.nan)
-        n = np.interp(ts, t_ns, n_arr, left=np.nan, right=np.nan)
-        u = np.interp(ts, t_ns, u_arr, left=np.nan, right=np.nan)
-        return e, n, u
+    # Covariance: already in ENU frame from the CSV, so interpolate element-wise.
+    has_cov = gps_sorted[0].cov_enu is not None
+    if has_cov:
+        cov_flat = np.array([g.cov_enu.ravel() for g in gps_sorted], dtype=np.float64)  # (N, 9)
 
-    return interp, {"t_ns": t_ns, "origin": (g0.lat, g0.lon, g0.alt)}
+    class _Interp:
+        def __call__(self, ts_ns):
+            ts = np.asarray(ts_ns, dtype=np.int64)
+            e = np.interp(ts, t_ns, e_arr, left=np.nan, right=np.nan)
+            n = np.interp(ts, t_ns, n_arr, left=np.nan, right=np.nan)
+            u = np.interp(ts, t_ns, u_arr, left=np.nan, right=np.nan)
+            return e, n, u
+
+        def covariance(self, ts_ns):
+            if not has_cov:
+                return None
+            ts = np.asarray(ts_ns, dtype=np.int64)
+            interped = np.array([np.interp(ts, t_ns, cov_flat[:, i], left=np.nan, right=np.nan)
+                                 for i in range(9)], dtype=np.float64)
+            return interped.reshape(3, 3)
+
+    return _Interp(), {"t_ns": t_ns, "origin": (g0.lat, g0.lon, g0.alt)}
 
 
 def read_casualty_csv(csv_path: str) -> List[Tuple[str, float, float, float]]:

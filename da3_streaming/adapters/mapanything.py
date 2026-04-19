@@ -24,30 +24,41 @@ class MapAnythingAdapter:
         print("MapAnything model loaded.")
 
     
-    def infer(self, image_paths: List[str]) -> Predictions:
+    def infer(self, image_paths: List[str], intrinsics_prior=None) -> Predictions:
         """
         Run inference and return unified Predictions object.
-        
+
         Args:
             image_paths: List of paths to images
-            
+            intrinsics_prior: optional (3, 3) ndarray. If provided, injected into
+                every view's 'intrinsics' key so MA conditions on it instead of
+                re-predicting per chunk.
+
         Returns:
             Predictions object with W2C extrinsics
         """
         from mapanything.utils.image import load_images
-        
+
         # 1. Load images
         views = load_images(image_paths)
         print(f"Loaded {len(views)} views")
 
-        # 2. Run inference
+        # 2. Optionally inject intrinsics prior
+        if intrinsics_prior is not None:
+            K = torch.as_tensor(
+                np.asarray(intrinsics_prior, dtype=np.float32)
+            ).to(self.device)
+            for v in views:
+                v["intrinsics"] = K[None]   # (1, 3, 3) to match per-view B=1
+
+        # 3. Run inference
         with torch.no_grad():
             outputs = self.model.infer(views,
                                     #    use_multiview_confidence=True,
                                     #    confidence_percentile=10,
                                     #    apply_confidence_mask=True,
                                     # # apply_mask=True, # Apply masking to dense geometry outputs
-                                    # mask_edges=True, 
+                                    # mask_edges=True,
                                 )
 
         print("Inference complete!")

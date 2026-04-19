@@ -154,6 +154,10 @@ class Any_StreamingRT:
             self.gps_interp, self.gps_meta = build_enu_interpolator(gps_rows)
             print(f"GPS loaded: {len(gps_rows)} samples")
         self._kitti_poses_cache: np.ndarray | None = None        # loaded once, reused every chunk
+        self._intrinsics_prior: np.ndarray | None = None  # set after chunk 0 when Model.inject_pred_intrinsics=true
+        self._inject_pred_intrinsics: bool = bool(
+            self.config.get("Model", {}).get("inject_pred_intrinsics", False)
+        )
         self.acc_cam_positions: list = []   # list of [K,3] arrays, non-overlap camera positions
         self.frame_image_paths: list = []   # parallel to acc_cam_positions (flattened)
         self.acc_frame_c2w: list = []       # list of [K,4,4] c2w poses per chunk (world frame)
@@ -221,11 +225,30 @@ class Any_StreamingRT:
                 predictions.conf -= 1.0  # Conf correction for DA3
 
             elif self.model_type == "MapAnything":
-                predictions = self.model.infer(image_paths)
+                predictions = self.model.infer(
+                    image_paths,
+                    intrinsics_prior=self._intrinsics_prior,
+                )
 
         infer_time = time.time() - t0
         self.total_infer_time += infer_time
         print(f"  [chunk {chunk_idx}] inference: {infer_time:.2f}s  mean depth: {np.mean(predictions.depth):.3f}")
+
+        # After the first chunk, freeze a per-sequence intrinsics prior for MA reuse.
+        if (self._inject_pred_intrinsics
+                and self.model_type == "MapAnything"
+                and self._intrinsics_prior is None
+                and predictions.intrinsics is not None
+                and predictions.intrinsics.shape[0] > 0):
+            K_stack = np.asarray(predictions.intrinsics, dtype=np.float64)  # (N, 3, 3)
+            K_prior = np.median(K_stack, axis=0)
+            K_prior[2] = [0.0, 0.0, 1.0]   # enforce exact bottom row
+            self._intrinsics_prior = K_prior
+            fx, fy = K_prior[0, 0], K_prior[1, 1]
+            cx, cy = K_prior[0, 2], K_prior[1, 2]
+            print(f"  [inject_pred_intrinsics] prior from chunk {chunk_idx} "
+                  f"(median of {K_stack.shape[0]} frames): "
+                  f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}")
         with open(self.log_file, "a") as f:
             f.write(f"chunk_{chunk_idx}_infer: {infer_time:.2f}s\n")
         torch.cuda.empty_cache()
@@ -864,50 +887,122 @@ class Any_StreamingRT:
         pgo_cfg = self.config.get("GPS_PGO", {})
         gps_every_k = pgo_cfg.get("gps_every_k", 5)
 
-        # ── Build position constraints in metric GPS frame ─────────
-        # No inverse projection - optimize_gps takes raw GPS positions and does
-        # model -> GPS projection internally via Umeyama tuple.
-        def _abs_pos_constraint(k):
-            p_k_gps = chunk_gt_pos[k].astype(np.float64)
-            cov_k = None 
-            return (k, p_k_gps, cov_k)
+        # ── Build per-frame 5-DOF GPS measurements ─────────
+        # Each measurement binds chunk k's Similarity3 to one GPS sample:
+        #   p_obs: GPS position in metric frame
+        #   v_obs: GPS heading unit vector (adjacent-sample diff)
+        #   c_loc: frame camera position in chunk-local coords
+        #   v_loc: local camera motion direction (adjacent-sample diff)
 
-        position_constraints = []
-        for k in range(0, n_chunks, gps_every_k):
-            if not np.all(np.isfinite(chunk_gt_pos[k])):
-                print(f"  [GPS-PGO] Skipping chunk {k}: no valid GPS position")
-                continue
-            position_constraints.append(_abs_pos_constraint(k))
-        print(f"  [GPS-PGO] {len(position_constraints)} position-only constraints "
-              f"(every {gps_every_k} chunks, {n_chunks} total, starting at k=0)")
-        if not position_constraints:
-            print("  No GPS constraints generated. Skipping PGO.")
+        gps_every_n_frames = pgo_cfg.get("gps_anchor_freq", 1)
+        gps_measurements = []
+        ov = self.overlap
+
+        gps_pos_all = np.full((max(self.acc_frame_global_indices) + 2, 3), np.nan,
+                              dtype=np.float64)
+        gps_cov_all = None  # None → isotropic fallback (KITTI); ndarray → per-frame (drone)
+
+        # Need per-frame GPS positions.
+        if kitti_poses is not None:
+            # KITTI - per frame GT poses, dense.
+            n_kitti = min(kitti_poses.shape[0], gps_pos_all.shape[0])
+            gps_pos_all[:n_kitti] = kitti_poses[:n_kitti, :3, 3].astype(np.float64)
+        elif self.gps_interp is not None:
+            # drone - interpolate gps csv per frame via timestamp
+            gps_cov_all = np.full((gps_pos_all.shape[0], 3, 3), np.nan, dtype=np.float64) 
+            # gfi_to_path maps global-frame-index → image path (for ts extraction).
+            gfi_to_path = {
+                gfi: self.frame_image_paths[i]
+                for i, gfi in enumerate(self.acc_frame_global_indices)
+            }
+            for gfi, path in gfi_to_path.items():
+                ts = extract_ts_ns(path)
+                if ts is None:
+                    continue
+                e, n, u = self.gps_interp(ts)
+                if np.isfinite(e) and np.isfinite(n) and np.isfinite(u):
+                    gps_pos_all[gfi] = [float(e), float(n), float(u)]
+                    cov = self.gps_interp.covariance(ts)
+                    if cov is None:
+                        raise RuntimeError(
+                            f"GPS CSV path active but no position_covariance at ts={ts}. "
+                            f"Ensure the GPS CSV includes covariance columns and "
+                            f"build_enu_interpolator exposes .covariance(ts)."
+                        )
+                    gps_cov_all[gfi] = np.asarray(cov, dtype=np.float64).reshape(3, 3)
+
+        else:
+            print("  [GPS-PGO-Sim3] No GPS source (kitti_poses=None, gps_interp=None). Skipping.")
             return
+        
 
-        # Log the GPS anchor positions as red markers so they're visible in
-        # Rerun alongside baseline (yellow), gt (green), and pgo (cyan).
-        anchor_pts = np.array(
-            [p for (_, p, _) in position_constraints], dtype=np.float64
-        )
+        for k, (start, end) in enumerate(self.chunk_indices):
+            c2w_local = self._acc_frame_c2w_local[k]  # (n_local, 4, 4)
+            n_local = c2w_local.shape[0]
+            if n_local < 2:
+                continue
+            # local→global frame mapping for this chunk (matches accumulation logic)
+            if k == 0:
+                global_start = start
+            else:
+                global_start = start + ov
+
+            c_loc_all = c2w_local[:, :3, 3].astype(np.float64)   # (n_local, 3)
+            # local velocity direction by central diff (fwd/bwd at boundaries)
+            v_loc_all = np.zeros_like(c_loc_all)
+            v_loc_all[1:-1] = c_loc_all[2:] - c_loc_all[:-2]
+            v_loc_all[0] = c_loc_all[1] - c_loc_all[0]
+            v_loc_all[-1] = c_loc_all[-1] - c_loc_all[-2]
+
+            for i_local in range(0, n_local, gps_every_n_frames):
+                g = global_start + i_local
+                # need g-1 and g+1 for GPS heading differencing
+                if g <= 0 or g >= gps_pos_all.shape[0] - 1:
+                    continue
+                p_obs = gps_pos_all[g]
+                p_prev = gps_pos_all[g - 1]
+                p_next = gps_pos_all[g + 1]
+                if not (np.all(np.isfinite(p_obs)) and
+                        np.all(np.isfinite(p_prev)) and
+                        np.all(np.isfinite(p_next))):
+                    continue
+                v_obs_raw = p_next - p_prev
+
+                # Per-measurement covariance: use sensor cov when available,
+                # else fall back to isotropic from config (KITTI path).
+                if pgo_cfg.get("gps_cov_isotropic", False):
+                    cov = None  # force isotropic fallback (uses gps_sigma_t)
+                else:
+                    cov = gps_cov_all[g] if gps_cov_all is not None else None
+
+                gps_measurements.append({
+                    "chunk_k": k,
+                    "p_obs": p_obs,
+                    "v_obs": v_obs_raw,
+                    "c_loc": c_loc_all[i_local],
+                    "v_loc": v_loc_all[i_local],
+                    "cov": cov,
+                })
+
+        print(f"  [GPS-PGO-Sim3] {len(gps_measurements)} per-frame GPS measurements "
+              f"(every {gps_every_n_frames} frame(s), {n_chunks} chunks)")
+        if not gps_measurements:
+            print("  No GPS measurements generated. Skipping PGO.")
+            return
+        
+        anchor_pts = np.array([m["p_obs"] for m in gps_measurements], dtype=np.float64)
         self._log_gps_anchors_rerun(anchor_pts)
-
-        # ── PGO returns per-chunk absolute GPS-frame Sim3s ─────────────────────
-        # NOTE: self.sim3_list is intentionally NOT updated. It stays as the
-        # depth-model relative chain in model frame. PGO results live in acc_*
-        # via the GPS-frame absolutes, not in sim3_list.
         optimizer = Sim3LoopOptimizer(self.config, device="cpu")
-        abs_gps = optimizer.optimize_gps(
+        abs_gps = optimizer.optimize_gps_sim3(
             self.sim3_list,
-            position_constraints,
+            gps_measurements,
             umeyama=(s_g, R_g, t_g),
         )
 
-        # ── apply GPS-frame absolutes to acc_frame_c2w / cam_positions / pts ──
         self._apply_gps_absolutes(abs_gps)
 
         print("  GPS-PGO complete. Poses updated.\n")
 
-        # Log GT trajectory in GPS frame (raw — no Umeyama inverse needed).
         if kitti_poses is not None:
             self._log_gt_rerun_gps_frame(kitti_poses)
 
@@ -1090,12 +1185,24 @@ class Any_StreamingRT:
                     from PIL import Image as PILImage
                     depth_np = np.asarray(cur_pred.depth[sl])   # [K, H, W]
                     conf_np  = np.asarray(cur_pred.conf[sl])    # [K, H, W]
+                    K_pred_np = np.asarray(cur_pred.intrinsics[sl])  # [K, 3, 3]
+                    K_prior = self._intrinsics_prior  # (3,3) or None
                     for local_i, (fp, gfi) in enumerate(zip(frame_paths, global_indices)):
                         rr.set_time("frame_idx", sequence=int(gfi))
                         img = PILImage.open(fp).convert("RGB")
                         rr.log("camera/image", rr.Image(np.array(img)))
-                        rr.log("camera/depth", rr.DepthImage(depth_np[local_i].astype(np.float32)))
-                        rr.log("camera/conf",  rr.DepthImage(conf_np[local_i].astype(np.float32)))
+                        rr.log("depth",        rr.DepthImage(depth_np[local_i].astype(np.float32)))
+                        rr.log("confidence",   rr.DepthImage(conf_np[local_i].astype(np.float32)))
+                        K = K_pred_np[local_i]
+                        rr.log("intrinsics/fx/pred", rr.Scalars(float(K[0, 0])))
+                        rr.log("intrinsics/fy/pred", rr.Scalars(float(K[1, 1])))
+                        rr.log("intrinsics/cx/pred", rr.Scalars(float(K[0, 2])))
+                        rr.log("intrinsics/cy/pred", rr.Scalars(float(K[1, 2])))
+                        if K_prior is not None:
+                            rr.log("intrinsics/fx/prior", rr.Scalars(float(K_prior[0, 0])))
+                            rr.log("intrinsics/fy/prior", rr.Scalars(float(K_prior[1, 1])))
+                            rr.log("intrinsics/cx/prior", rr.Scalars(float(K_prior[0, 2])))
+                            rr.log("intrinsics/cy/prior", rr.Scalars(float(K_prior[1, 2])))
                 except Exception as e:
                     print(f"  [rerun] per-frame log failed: {e}")
 
@@ -1309,12 +1416,16 @@ if __name__ == "__main__":
                         help="Path to KITTI GT poses file for GPS-PGO (e.g. poses/07.txt)")
     parser.add_argument("--gps_every_k", type=int, default=None,
                         help="Override GPS_PGO.gps_every_k from config (anchor every k-th chunk)")
+    parser.add_argument("--gps_anchor_freq", type=int, default=None,
+                        help="Override GPS_PGO.gps_anchor_freq from config (one 5-DOF factor every N frames)")
     rr.script_add_args(parser)  # adds --rr-addr, --save etc; must be called before parse_args
     args = parser.parse_args()
 
     config = load_config(args.config)
     if args.gps_every_k is not None:
         config.setdefault("GPS_PGO", {})["gps_every_k"] = args.gps_every_k
+    if args.gps_anchor_freq is not None:
+        config.setdefault("GPS_PGO", {})["gps_anchor_freq"] = args.gps_anchor_freq
 
     if args.output_dir is None:
         ts = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")

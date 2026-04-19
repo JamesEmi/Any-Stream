@@ -31,6 +31,64 @@ try:
 except Exception:
     print("Sim3solve of C++ Version failed, Will using Python Version.")
 
+class Sim3GPSFactor(gtsam.CustomFactor):
+    """
+    5-DOF GPS factor on a gtsam.Similarity3 chunk pose.
+
+    Residual layout (5-vec):
+        r[0:2] = Unit3(R_k @ v_loc).localCoordinates(Unit3(v_gps))    # heading (on S^2)
+        r[2:5] = s_k * (R_k @ c_loc) + t_k - p_obs                    # position (metric)
+
+    Jacobian is numerical (central differences on the 7-DOF Sim3 tangent
+    [omega(3), v(3), sigma(1)]).
+
+    Measurements:
+        p_obs:  GPS position in GPS/metric frame, 3-vec.
+        v_obs:  GPS heading unit vector (from Doppler or adjacent-position diff), 3-vec.
+    Static inputs (per frame):
+        c_loc:  camera position in the chunk's local frame (c2w_local[:3, 3]).
+        v_loc:  local camera motion direction (normalized diff of neighboring c_loc).
+    """
+    def __init__(self, key, p_obs, v_obs, c_loc, v_loc, noise_model):
+        def _unit(v):
+            v = np.asarray(v, dtype=np.float64).reshape(3)
+            n = np.linalg.norm(v)
+            return v / n if n > 1e-12 else v
+        self._p_obs = np.asarray(p_obs, dtype=np.float64).reshape(3)
+        self._c_loc = np.asarray(c_loc, dtype=np.float64).reshape(3)
+        self._v_obs = _unit(v_obs)
+        self._v_loc = _unit(v_loc)
+        super().__init__(noise_model, [key], self._error_func)
+
+    def _residual(self, X):
+        s = X.scale()
+        R = X.rotation().matrix()
+        t = np.asarray(X.translation()).reshape(3)
+        r_pos = s * (R @ self._c_loc) + t - self._p_obs
+        v_pred_world = R @ self._v_loc
+        if np.linalg.norm(v_pred_world) < 1e-12:
+            r_head = np.zeros(2)
+        else:
+            u_pred = gtsam.Unit3(gtsam.Point3(*v_pred_world))
+            u_obs = gtsam.Unit3(gtsam.Point3(*self._v_obs))
+            r_head = u_pred.localCoordinates(u_obs)
+        return np.concatenate([r_head, r_pos])
+    
+    def _error_func(self, this, values, H):
+        key = this.keys()[0]
+        X = values.atSimilarity3(key)
+        r = self._residual(X)
+        if H is not None:
+            eps = 1e-6
+            J = np.zeros((5,7), dtype=np.float64)
+            for i in range(7):
+                dx = np.zeros(7, dtype=np.float64); dx[i]=eps
+                rp = self._residual(X.retract(dx))
+                rm = self._residual(X.retract(-dx))
+                J[:, i] = (rp - rm) / (2.0 * eps)
+            H[0] = J
+        return r
+
 
 class Sim3LoopOptimizer:
     """
@@ -527,7 +585,137 @@ class Sim3LoopOptimizer:
 
         return optimised_abs_gps
 
+    def optimize_gps_sim3(
+        self,
+        sequential_transforms,
+        gps_measurements, # list of dicts: {chunk_k, p_obs, v_obs, c_loc, v_loc, cov?} - TODO: Recheck this
+        umeyama,          # (s_g, R_g, t_g) model -> GPS similarity
+        max_iterations: int = None,
+        lambda_init: float = None,
+    ):
+        """
+        Sim3-variable GPS PGO with 5-DOF per-frame factors
+
+        Per chunk k the variable X(k) is a gtsam.Similarity3 (s_k, R_k, t_k) in
+        GPS frame. The optimized s_k stretches the chunk interior uniformly about
+        its anchor.
+
+        Returns per-chunk absolute GPS-frame Sim3 tuples (s_k, R_k, t_k).
+        """
+        if max_iterations is None:
+            max_iterations = self.config["Loop"]["SIM3_Optimizer"]["max_iterations"]
+        if lambda_init is None:
+            lambda_init = eval(self.config["Loop"]["SIM3_Optimizer"]["lambda_init"])
         
+        cfg = self.config["Loop"]["SIM3_Optimizer"]
+        heading_sigma = float(cfg.get("heading_sigma", 0.1))
+        gps_sigma_t = float(cfg.get("gps_sigma_t", 0.1))
+        # Between-factor rot/trans can be set jointly via seq_sigma (isotropic fallback)
+        # or independently via seq_sigma_R / seq_sigma_t. The split lets us weld chunk
+        # rotation to VO (seq_sigma_R small) while keeping translation loose so GPS
+        # position factors can still correct per-chunk placement (seq_sigma_t larger).
+        seq_sigma = float(cfg.get("seq_sigma", 0.01))
+        seq_sigma_R = float(cfg.get("seq_sigma_R", seq_sigma))
+        seq_sigma_t = float(cfg.get("seq_sigma_t", seq_sigma))
+        seq_sigma_scale = float(cfg.get("scale_bw_sigma", 0.05))
+        scale_prior_sigma = float(cfg.get("scale_prior_sigma", 0.0))  # 0 = disabled
+        # TODO: write out details of these params.
+
+        s_g, R_g, t_g = umeyama
+        abs_poses_model = self.sequential_to_absolute_poses(sequential_transforms)
+        n_chunks = abs_poses_model.shape[0]
+
+        # initial Similarity3 per chunk = Umeyama ∘ model-frame absolute
+        init_sim3 = []
+        for k in range(n_chunks):
+            s_m, R_m, t_m = self.pypose_sim3_to_numpy(pp.Sim3(abs_poses_model[k]))
+            s_k = float(s_g) * float(s_m)
+            R_k = R_g @ R_m
+            t_k = s_g * (R_g @ t_m) + t_g
+            init_sim3.append(gtsam.Similarity3(gtsam.Rot3(R_k), gtsam.Point3(*t_k), s_k))
+
+        graph = gtsam.NonlinearFactorGraph()
+        initial = gtsam.Values()
+        X = lambda k: gtsam.symbol('x', k)
+        for k in range(n_chunks):
+            initial.insert(X(k), init_sim3[k])
+
+        # 5-DOF GPS Factors
+        n_gps_factors = 0
+        for m in gps_measurements:
+            k = int(m["chunk_k"])
+            if k<0 or k>=n_chunks:
+                continue
+            p_obs = np.asarray(m["p_obs"], dtype=np.float64).reshape(3)
+            v_obs = np.asarray(m["v_obs"], dtype=np.float64).reshape(3)
+            c_loc = np.asarray(m["c_loc"], dtype=np.float64).reshape(3)
+            v_loc = np.asarray(m["v_loc"], dtype=np.float64).reshape(3)
+            if not (np.all(np.isfinite(p_obs)) and np.all(np.isfinite(v_obs))
+                    and np.all(np.isfinite(c_loc)) and np.all(np.isfinite(v_loc))):
+                continue
+            if np.linalg.norm(v_obs) < 1e-8 or np.linalg.norm(v_loc) < 1e-8:
+                continue
+            
+            cov = m.get("cov", None)
+            cov5 = np.zeros((5, 5), dtype=np.float64)
+            cov5[0, 0] = heading_sigma ** 2
+            cov5[1, 1] = heading_sigma ** 2
+            if cov is None:
+                cov5[2, 2] = cov5[3, 3] = cov5[4, 4] = gps_sigma_t ** 2
+            else:
+                cov3 = np.asarray(cov, dtype=np.float64).reshape(3, 3)
+                if cov3[2, 2] < 1e-9:
+                    cov3[2, 2] = 100.0 * max(cov3[0, 0], cov3[1, 1], 1e-6)
+                cov5[2:5, 2:5] = cov3 + 1e-9 * np.eye(3)
+            noise = gtsam.noiseModel.Gaussian.Covariance(cov5)
+            #TODO: check if the noise model is sensible.
+
+            graph.add(Sim3GPSFactor(X(k), p_obs, v_obs, c_loc, v_loc, noise))
+            n_gps_factors += 1
+
+        # 7-DOF sequential between factors. Similarity3 tangent order = [ω(3), v(3), σ(1)]
+        between_sigmas = np.array([
+            seq_sigma_R, seq_sigma_R, seq_sigma_R,
+            seq_sigma_t, seq_sigma_t, seq_sigma_t,
+            seq_sigma_scale,
+        ], dtype=np.float64)
+        between_noise = gtsam.noiseModel.Diagonal.Sigmas(between_sigmas)
+        for k in range(n_chunks - 1):
+            rel = init_sim3[k].between(init_sim3[k + 1])
+            graph.add(gtsam.BetweenFactorSimilarity3(X(k), X(k + 1), rel, between_noise))
+
+        # optional weak global-scale prior on chunk 0
+        if scale_prior_sigma > 0.0:
+            prior_sigmas = np.asarray(
+                [1e3, 1e3, 1e3, 1e3, 1e3, 1e3, scale_prior_sigma], dtype=np.float64
+            )
+            prior_noise = gtsam.noiseModel.Diagonal.Sigmas(prior_sigmas)
+            graph.addPriorSimilarity3(X(0), init_sim3[0], prior_noise)
+
+        params = gtsam.LevenbergMarquardtParams()
+        params.setMaxIterations(max_iterations)
+        params.setlambdaInitial(lambda_init)
+
+        lm = gtsam.LevenbergMarquardtOptimizer(graph, initial, params)
+        initial_error = lm.error()
+        result = lm.optimize()
+        final_error = lm.error()
+        iterations = lm.iterations()
+        print(f"  [GPS-PGO-Sim3] {n_gps_factors} GPS factors, {n_chunks - 1} between factors")
+        print(f"  [GPS-PGO-Sim3] sigmas: head={heading_sigma}  gps_t={gps_sigma_t}  "
+              f"seq_R={seq_sigma_R}  seq_t={seq_sigma_t}  seq_s={seq_sigma_scale}")
+        print(f"  [GPS-PGO-Sim3] LM: initial error={initial_error:.6f}  "
+              f"final error={final_error:.6f}  iterations={iterations}")
+        
+        out = []
+        for k in range(n_chunks):
+            Xk = result.atSimilarity3(X(k))
+            s_k = float(Xk.scale())
+            R_k = Xk.rotation().matrix()
+            t_k = np.asarray(Xk.translation()).reshape(3)
+            out.append((s_k, R_k, t_k))
+        return out
+
 # ======== TEST CODE ========
 
 
