@@ -5,12 +5,12 @@ Weights:
   SALAD: '/mnt/data/any-stream/any-stream/weights/dino_salad.ckpt'
 
 Model:
-  chunk_size: 160
-  overlap: 40
+  chunk_size: 16
+  overlap: 4
   loop_chunk_size: 20
   loop_enable: False
   useDBoW: False
-  delete_temp_files: False
+  delete_temp_files: True
   align_lib: 'triton'
   align_method: 'sim3'
   scale_compute_method: 'auto'
@@ -70,5 +70,5 @@ GPS_PGO:
   enabled: true
   method: 'pgo'
   gps_anchor_freq: 1          # one 5-DOF factor every N frames
-  gps_cov_isotropic: true     # true → ignore sensor cov, use gps_sigma_t
+  gps_cov_isotropic: false     # true → ignore sensor cov, use gps_sigma_t
   use_start_prior: false

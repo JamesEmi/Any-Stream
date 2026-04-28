@@ -1,0 +1,72 @@
+Weights:
+  model: 'DA3'
+  DA3: '/mnt/data/any-stream/any-stream/weights/model.safetensors'
+  DA3_CONFIG: '/mnt/data/any-stream/any-stream/weights/config.json'
+  SALAD: '/mnt/data/any-stream/any-stream/weights/dino_salad.ckpt'
+
+# TartanAir is 30 fps (KITTI is 10 fps). chunk_size/overlap are algorithmic, not
+# temporal — leaving them at the KITTI defaults to start; bump if per-chunk
+# baseline turns out too short for reliable scale estimation.
+Model:
+  chunk_size: 10
+  overlap: 5
+  loop_chunk_size: 20
+  loop_enable: False
+  useDBoW: False
+  delete_temp_files: True
+  align_lib: 'triton'
+  align_method: 'sim3'
+  scale_compute_method: 'auto'
+  align_type: 'dense'
+
+  ref_view_strategy: 'middle'
+  ref_view_strategy_loop: 'saddle_balanced'
+  depth_threshold: 15.0
+
+  save_depth_conf_result: False
+  save_debug_info: False
+
+  Sparse_Align:
+    keypoint_select: 'orb'
+    keypoint_num: 5000
+
+  IRLS:
+    delta: 0.1
+    max_iters: 5
+    tol: 1e-9
+
+  Pointcloud_Save:
+    sample_ratio: 0.015
+    conf_threshold_coef: 0.75
+    use_conf_filtering: True
+
+Loop:
+  SALAD:
+    image_size: [336, 336]
+    batch_size: 32
+    similarity_threshold: 0.85
+    top_k: 5
+    use_nms: True
+    nms_threshold: 25
+
+  SIM3_Optimizer:
+    lang_version: 'python'
+    max_iterations: 30
+    lambda_init: 1e-6
+    gps_sigma_t: 0.01    # GPS unary fallback sigma (m); "GPS" = x,y,z from TartanAir GT
+    # seq_sigma controls BetweenFactorSim3 rot/trans as a joint isotropic fallback.
+    # seq_sigma_R / seq_sigma_t override it when set. Use the split to weld rotation
+    # to VO (tight seq_sigma_R) while keeping translation loose enough that per-chunk
+    # GPS position factors can still pull chunks into place.
+    seq_sigma: 0.03
+    seq_sigma_R: 1.0e-4
+    seq_sigma_t: 0.05
+    heading_sigma: 0.3
+    scale_bw_sigma: 0.05
+    scale_prior_sigma: 0.0
+
+GPS_PGO:
+  enabled: true
+  method: 'pgo'
+  gps_anchor_freq: 1
+  use_start_prior: false

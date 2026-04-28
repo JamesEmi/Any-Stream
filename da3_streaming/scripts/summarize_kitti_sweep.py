@@ -6,7 +6,8 @@ import os
 import sys
 
 # EXP_ROOT = "/mnt/data/slam-proj/exps/kitti_sweep"
-EXP_ROOT = "/mnt/data/slam-proj/exps/kitti_sweep_gps_no_prior"
+# EXP_ROOT = "/mnt/data/slam-proj/exps/kitti_sweep_gps_no_prior"
+EXP_ROOT = "/mnt/data/slam-proj/exps/gtsam/custom5dof/kitti_sweep_sim3_optim"
 if len(sys.argv) > 1:
     EXP_ROOT = sys.argv[1]
 

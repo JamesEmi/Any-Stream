@@ -43,7 +43,13 @@ from loop_utils.sim3utils import (
 from safetensors.torch import load_file
 from depth_anything_3.api import DepthAnything3
 from viz_ply_cas import read_gps_csv, build_enu_interpolator, extract_ts_ns, umeyama_alignment
-from eval.kitti_utils import load_kitti_poses, save_kitti_poses
+from eval.pose_utils import load_poses, save_poses
+
+# OpenCV world (Y-down, Z-forward) → Z-up viz. Applied at log time to all
+# model-frame quantities (pointcloud, trajectory, camera Transform3D).
+# Matches the pattern in /home/ubuntu/anyslam/lingbot-map/demo.py.
+R_Z_UP = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float32)
+
 
 def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
     """
@@ -105,9 +111,11 @@ def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
 
 
 class Any_StreamingRT:
-    def __init__(self, image_dir, save_dir, config, gps_csv=None, kitti_poses=None):
+    def __init__(self, image_dir, save_dir, config, gps_csv=None, poses=None,
+                 frame_stride=1):
         self.config = config
-        self.kitti_poses_path = kitti_poses
+        self.poses_path = poses
+        self.frame_stride = max(1, int(frame_stride))
 
         self.chunk_size = self.config["Model"]["chunk_size"]
         self.overlap = self.config["Model"]["overlap"]
@@ -153,7 +161,7 @@ class Any_StreamingRT:
             gps_rows = read_gps_csv(gps_csv)
             self.gps_interp, self.gps_meta = build_enu_interpolator(gps_rows)
             print(f"GPS loaded: {len(gps_rows)} samples")
-        self._kitti_poses_cache: np.ndarray | None = None        # loaded once, reused every chunk
+        self._poses_cache: np.ndarray | None = None        # loaded once, reused every chunk
         self._intrinsics_prior: np.ndarray | None = None  # set after chunk 0 when Model.inject_pred_intrinsics=true
         self._inject_pred_intrinsics: bool = bool(
             self.config.get("Model", {}).get("inject_pred_intrinsics", False)
@@ -176,6 +184,11 @@ class Any_StreamingRT:
         elif model_type == "MapAnything":
             from adapters.mapanything import MapAnythingAdapter
             self.model = MapAnythingAdapter(device=self.device)
+            self.model.load()
+
+        elif model_type == "VGGT":
+            from adapters.vggt import VGGTAdapter
+            self.model = VGGTAdapter(device=self.device)
             self.model.load()
 
         else:
@@ -229,6 +242,9 @@ class Any_StreamingRT:
                     image_paths,
                     intrinsics_prior=self._intrinsics_prior,
                 )
+
+            elif self.model_type == "VGGT":
+                predictions = self.model.infer(image_paths)
 
         infer_time = time.time() - t0
         self.total_infer_time += infer_time
@@ -436,19 +452,22 @@ class Any_StreamingRT:
 
         rr.set_time("stable_time", sequence=self._rr_time)
         self._rr_time += 1
-        rr.log("map/pointcloud", rr.Points3D(positions=all_pts, colors=all_cols))
+        rr.log("map/pointcloud", rr.Points3D(
+            positions=(R_Z_UP @ all_pts.T).T, colors=all_cols
+        ))
         print(f"  [rerun] {len(all_pts):,} pts logged  "
               f"(total acc: {sum(len(p) for p in self.acc_pts):,})")
 
         # Rolling predicted trajectory (model frame, white)
         if self.acc_cam_positions:
             traj = np.concatenate(self.acc_cam_positions, axis=0).astype(np.float32)
+            traj_viz = (R_Z_UP @ traj.T).T
             rr.log("trajectories/pred", rr.Points3D(
-                positions=traj,
-                colors=np.full((len(traj), 3), [255, 255, 255], dtype=np.uint8),
+                positions=traj_viz,
+                colors=np.full((len(traj_viz), 3), [255, 255, 255], dtype=np.uint8),
             ))
-            if len(traj) >= 2:
-                rr.log("trajectories/pred_line", rr.LineStrips3D([traj], colors=[[255, 255, 255]]))
+            if len(traj_viz) >= 2:
+                rr.log("trajectories/pred_line", rr.LineStrips3D([traj_viz], colors=[[255, 255, 255]]))
 
     def _compute_gps_alignment(self):
         """
@@ -534,13 +553,13 @@ class Any_StreamingRT:
         print(f"  [rerun/gps] {len(global_pts):,} pts, "
               f"{len(cam_global)} pred poses, {len(gps_f32)} gps poses")
 
-    def _save_poses_kitti(self, out_path: str):
+    def _save_poses(self, out_path: str):
         """Save accumulated per-frame c2w poses in KITTI format (3x4 per line)."""
         if not self.acc_frame_c2w:
             print("  No poses to save.")
             return
         all_c2w = np.concatenate(self.acc_frame_c2w, axis=0)  # [N, 4, 4]
-        save_kitti_poses(all_c2w, out_path)
+        save_poses(all_c2w, out_path)
         print(f"Saved {len(all_c2w)} poses → {out_path}")
 
     def _recompute_poses_from_sim3(self):
@@ -652,14 +671,14 @@ class Any_StreamingRT:
         self.acc_pts = new_pts
         self._acc_chunk_sim3 = new_chunk_sim3
 
-    def _log_gt_rerun_gps_frame(self, kitti_poses: np.ndarray):
+    def _log_gt_rerun_gps_frame(self, poses: np.ndarray):
         """
         Log GT trajectory directly in GPS frame (no Umeyama inverse).
 
         Used after GPS-PGO when acc_* already lives in GPS frame.
         """
-        n_gt = min(len(kitti_poses), sum(len(p) for p in self.acc_cam_positions))
-        gt_pos_all = kitti_poses[:n_gt, :3, 3].astype(np.float32)
+        n_gt = min(len(poses), sum(len(p) for p in self.acc_cam_positions))
+        gt_pos_all = poses[:n_gt, :3, 3].astype(np.float32)
         rr.log("trajectories/gt", rr.Points3D(
             positions=gt_pos_all,
             colors=np.full((len(gt_pos_all), 3), [0, 255, 0], dtype=np.uint8),
@@ -713,7 +732,7 @@ class Any_StreamingRT:
             [gps_enu], colors=[[0, 255, 0]],
         ), static=True)
 
-    def _fit_gt_alignment(self, kitti_poses: np.ndarray):
+    def _fit_gt_alignment(self, poses: np.ndarray):
         """Compute Umeyama alignment from predicted chunk positions to GT.
 
         Returns (s_g, R_g, t_g, chunk_gt_pos, chunk_gt_rot, pred_pos, pred_scales)
@@ -732,9 +751,9 @@ class Any_StreamingRT:
             ov = self.overlap
             rep = (start + (end - ov - start) // 2) if ci == 0 else \
                   ((start + ov) + (end - start - ov) // 2)
-            chunk_rep_frames.append(min(rep, len(kitti_poses) - 1))
+            chunk_rep_frames.append(min(rep, len(poses) - 1))
 
-        chunk_gt = np.array([kitti_poses[f] for f in chunk_rep_frames])
+        chunk_gt = np.array([poses[f] for f in chunk_rep_frames])
         chunk_gt_pos = chunk_gt[:, :3, 3]
         chunk_gt_rot = chunk_gt[:, :3, :3]
 
@@ -750,11 +769,11 @@ class Any_StreamingRT:
         s_g, R_g, t_g = umeyama_alignment(pred_pos, chunk_gt_pos, with_scale=True)
         return s_g, R_g, t_g, chunk_gt_pos, chunk_gt_rot, pred_pos, pred_scales
 
-    def _log_gt_rerun(self, kitti_poses: np.ndarray,
+    def _log_gt_rerun(self, poses: np.ndarray,
                       s_g: float, R_g: np.ndarray, t_g: np.ndarray):
         """Log GT trajectory in model frame as a static green line."""
-        n_gt = min(len(kitti_poses), sum(len(p) for p in self.acc_cam_positions))
-        gt_pos_all = kitti_poses[:n_gt, :3, 3]
+        n_gt = min(len(poses), sum(len(p) for p in self.acc_cam_positions))
+        gt_pos_all = poses[:n_gt, :3, 3]
         gt_model = ((1.0 / s_g) * ((gt_pos_all - t_g) @ R_g)).astype(np.float32)
         rr.log("trajectories/gt", rr.Points3D(
             positions=gt_model,
@@ -858,7 +877,7 @@ class Any_StreamingRT:
               f"|t_g|={np.linalg.norm(t_g):.3f}m")
         return s_g, R_g, t_g, chunk_gt_pos, chunk_gt_rot, pred_pos, pred_scales
 
-    def _run_gps_pgo(self, alignment_data: tuple, kitti_poses=None):
+    def _run_gps_pgo(self, alignment_data: tuple, poses=None):
         """GPS-based Pose Graph Optimization using position-only anchor constraints.
 
         Constrains only the translation of each anchored chunk; rotation and scale
@@ -866,7 +885,7 @@ class Any_StreamingRT:
 
         alignment_data: 7-tuple returned by _fit_gt_alignment or _fit_gps_csv_alignment:
           (s_g, R_g, t_g, chunk_gt_pos, chunk_gt_rot, pred_pos, pred_scales)
-        kitti_poses: if provided, GT trajectory is logged to Rerun after PGO.
+        poses: if provided, GT trajectory is logged to Rerun after PGO.
 
         Umeyama: s_g * R_g @ pred + t_g ≈ gt  maps model frame → GPS (metric) frame.
         Inverse: pos_model = (1/s_g) * R_g.T @ (pos_gps - t_g)
@@ -903,10 +922,10 @@ class Any_StreamingRT:
         gps_cov_all = None  # None → isotropic fallback (KITTI); ndarray → per-frame (drone)
 
         # Need per-frame GPS positions.
-        if kitti_poses is not None:
+        if poses is not None:
             # KITTI - per frame GT poses, dense.
-            n_kitti = min(kitti_poses.shape[0], gps_pos_all.shape[0])
-            gps_pos_all[:n_kitti] = kitti_poses[:n_kitti, :3, 3].astype(np.float64)
+            n_poses = min(poses.shape[0], gps_pos_all.shape[0])
+            gps_pos_all[:n_poses] = poses[:n_poses, :3, 3].astype(np.float64)
         elif self.gps_interp is not None:
             # drone - interpolate gps csv per frame via timestamp
             gps_cov_all = np.full((gps_pos_all.shape[0], 3, 3), np.nan, dtype=np.float64) 
@@ -932,7 +951,7 @@ class Any_StreamingRT:
                     gps_cov_all[gfi] = np.asarray(cov, dtype=np.float64).reshape(3, 3)
 
         else:
-            print("  [GPS-PGO-Sim3] No GPS source (kitti_poses=None, gps_interp=None). Skipping.")
+            print("  [GPS-PGO-Sim3] No GPS source (poses=None, gps_interp=None). Skipping.")
             return
         
 
@@ -1003,10 +1022,10 @@ class Any_StreamingRT:
 
         print("  GPS-PGO complete. Poses updated.\n")
 
-        if kitti_poses is not None:
-            self._log_gt_rerun_gps_frame(kitti_poses)
+        if poses is not None:
+            self._log_gt_rerun_gps_frame(poses)
 
-    def _run_gps_anchor_warp(self, kitti_poses_path: str):
+    def _run_gps_anchor_warp(self, poses_path: str):
         """Stage-2 GPS correction: piecewise-linear trajectory deformation.
 
         sim3_list is NOT modified. Per-chunk translation corrections are computed
@@ -1023,15 +1042,18 @@ class Any_StreamingRT:
         After the last anchor, correction is held constant.
         """
         print("\n=== GPS Anchor Warp ===")
-        kitti_poses = load_kitti_poses(kitti_poses_path)
-        print(f"Loaded {len(kitti_poses)} GT poses from {kitti_poses_path}")
+        poses = load_poses(poses_path)
+        if self.frame_stride > 1:
+            poses = poses[::self.frame_stride]
+        print(f"Loaded {len(poses)} GT poses from {poses_path}"
+              + (f" (stride={self.frame_stride})" if self.frame_stride > 1 else ""))
 
         n_chunks = len(self.chunk_indices)
         pgo_cfg = self.config.get("GPS_PGO", {})
         gps_every_k = pgo_cfg.get("gps_every_k", 5)
 
         s_g, R_g, t_g, chunk_gt_pos, chunk_gt_rot, pred_pos, pred_scales = \
-            self._fit_gt_alignment(kitti_poses)
+            self._fit_gt_alignment(poses)
         print(f"  Umeyama: scale={s_g:.4f}  |t_g|={np.linalg.norm(t_g):.3f}m")
 
         def gps_model(k):
@@ -1078,7 +1100,7 @@ class Any_StreamingRT:
         self.acc_pts = new_pts
         self._acc_chunk_sim3 = new_sim3
 
-        self._log_gt_rerun(kitti_poses, s_g, R_g, t_g)
+        self._log_gt_rerun(poses, s_g, R_g, t_g)
         print("  GPS anchor warp complete.\n")
 
     def run(self):
@@ -1089,7 +1111,12 @@ class Any_StreamingRT:
         )
         if not img_list:
             raise ValueError(f"No images found in {self.img_dir}")
-        print(f"Found {len(img_list)} images")
+        n_total = len(img_list)
+        if self.frame_stride > 1:
+            img_list = img_list[::self.frame_stride]
+            print(f"Found {n_total} images; using {len(img_list)} after stride={self.frame_stride}")
+        else:
+            print(f"Found {n_total} images")
 
         # Build chunk indices (mirrors Any_Streaming.get_chunk_indices)
         if len(img_list) <= self.chunk_size:
@@ -1153,22 +1180,25 @@ class Any_StreamingRT:
             self.acc_frame_global_indices.extend(global_indices)
 
             # Log GT trajectory up to current chunk end frame in model frame (visualization only)
-            if chunk_idx >= 1 and self.kitti_poses_path is not None:
-                if self._kitti_poses_cache is None:
-                    self._kitti_poses_cache = load_kitti_poses(self.kitti_poses_path)
+            if chunk_idx >= 1 and self.poses_path is not None:
+                if self._poses_cache is None:
+                    self._poses_cache = load_poses(self.poses_path)
+                    if self.frame_stride > 1:
+                        self._poses_cache = self._poses_cache[::self.frame_stride]
                 try:
-                    s_g, R_g, t_g, chunk_gt_pos, *_ = self._fit_gt_alignment(self._kitti_poses_cache)
+                    s_g, R_g, t_g, chunk_gt_pos, *_ = self._fit_gt_alignment(self._poses_cache)
                     cur_end = self.chunk_indices[chunk_idx][1]
-                    gt_pos = self._kitti_poses_cache[:cur_end, :3, 3]
+                    gt_pos = self._poses_cache[:cur_end, :3, 3]
                     gt_model = ((1.0 / s_g) * ((gt_pos - t_g) @ R_g)).astype(np.float32)
+                    gt_model_viz = (R_Z_UP @ gt_model.T).T
                     rr.set_time("stable_time", sequence=self._rr_time)
                     rr.log("trajectories/gt", rr.Points3D(
-                        positions=gt_model,
-                        colors=np.full((len(gt_model), 3), [0, 255, 0], dtype=np.uint8),
+                        positions=gt_model_viz,
+                        colors=np.full((len(gt_model_viz), 3), [0, 255, 0], dtype=np.uint8),
                     ))
-                    if len(gt_model) >= 2:
+                    if len(gt_model_viz) >= 2:
                         rr.log("trajectories/gt_line", rr.LineStrips3D(
-                            [gt_model], colors=[[0, 255, 0]]
+                            [gt_model_viz], colors=[[0, 255, 0]]
                         ))
                 except Exception as e:
                     print(f"  [GPS-vis] Skipped chunk {chunk_idx}: {e}")
@@ -1203,6 +1233,30 @@ class Any_StreamingRT:
                             rr.log("intrinsics/fy/prior", rr.Scalars(float(K_prior[1, 1])))
                             rr.log("intrinsics/cx/prior", rr.Scalars(float(K_prior[0, 2])))
                             rr.log("intrinsics/cy/prior", rr.Scalars(float(K_prior[1, 2])))
+
+                        # Camera frustum in world frame (same view as map/pointcloud)
+                        c2w = c2w_world[local_i]  # (4, 4)
+                        h_pin, w_pin = depth_np[local_i].shape[:2]
+                        t_c2w = c2w[:3, 3].astype(np.float32)
+                        R_c2w = c2w[:3, :3].astype(np.float32)
+                        rr.log(
+                            "map/camera",
+                            rr.Transform3D(
+                                translation=R_Z_UP @ t_c2w,
+                                mat3x3=R_Z_UP @ R_c2w,
+                            ),
+                        )
+                        rr.log(
+                            "map/camera/pinhole",
+                            rr.Pinhole(
+                                image_from_camera=K.astype(np.float32),
+                                height=int(h_pin),
+                                width=int(w_pin),
+                                camera_xyz=rr.ViewCoordinates.RDF,
+                                image_plane_distance=1.0,
+                            ),
+                        )
+                        rr.log("map/camera/pinhole/rgb", rr.Image(np.array(img)))
                 except Exception as e:
                     print(f"  [rerun] per-frame log failed: {e}")
 
@@ -1233,16 +1287,18 @@ class Any_StreamingRT:
 
         # Save baseline poses (before PGO)
         baseline_pose_path = os.path.join(self.output_dir, "poses_pred_baseline.txt")
-        self._save_poses_kitti(baseline_pose_path)
+        self._save_poses(baseline_pose_path)
 
         # ── Pre-compute Umeyama alignment so the baseline trajectory can be
         # logged in GPS frame, matching the post-PGO cyan line and the GT.
         pgo_cfg = self.config.get("GPS_PGO", {})
-        _kitti_poses = None
+        _poses = None
         _alignment = None
-        if self.kitti_poses_path is not None:
-            _kitti_poses = load_kitti_poses(self.kitti_poses_path)
-            _alignment = self._fit_gt_alignment(_kitti_poses)
+        if self.poses_path is not None:
+            _poses = load_poses(self.poses_path)
+            if self.frame_stride > 1:
+                _poses = _poses[::self.frame_stride]
+            _alignment = self._fit_gt_alignment(_poses)
         elif self.gps_interp is not None and self.sim3_list:
             _alignment = self._fit_gps_csv_alignment()
 
@@ -1265,18 +1321,18 @@ class Any_StreamingRT:
                 ))
 
         # GT trajectory + optional GPS-PGO
-        if self.kitti_poses_path is not None:
+        if self.poses_path is not None:
             # GT in GPS frame (raw KITTI poses, no projection).
-            self._log_gt_rerun_gps_frame(_kitti_poses)
+            self._log_gt_rerun_gps_frame(_poses)
 
             if pgo_cfg.get("enabled", False):
                 method = pgo_cfg.get("method", "anchor_warp")
                 if method == "pgo":
-                    self._run_gps_pgo(_alignment, kitti_poses=_kitti_poses)
+                    self._run_gps_pgo(_alignment, poses=_poses)
                 else:
-                    self._run_gps_anchor_warp(self.kitti_poses_path)
+                    self._run_gps_anchor_warp(self.poses_path)
                 pgo_pose_path = os.path.join(self.output_dir, "poses_pred_pgo.txt")
-                self._save_poses_kitti(pgo_pose_path)
+                self._save_poses(pgo_pose_path)
 
                 # Log PGO trajectory to Rerun (cyan, timestep N+1 → scrub to see correction)
                 self._rr_time += 1
@@ -1314,7 +1370,7 @@ class Any_StreamingRT:
                     else:
                         self._run_gps_pgo(_alignment)
                         pgo_pose_path = os.path.join(self.output_dir, "poses_pred_pgo.txt")
-                        self._save_poses_kitti(pgo_pose_path)
+                        self._save_poses(pgo_pose_path)
 
                         self._rr_time += 1
                         rr.set_time("stable_time", sequence=self._rr_time)
@@ -1343,7 +1399,15 @@ class Any_StreamingRT:
 
         # Save final poses (post-PGO if run, otherwise same as baseline)
         final_pose_path = os.path.join(self.output_dir, "poses_pred.txt")
-        self._save_poses_kitti(final_pose_path)
+        self._save_poses(final_pose_path)
+
+        # When stride>1, also dump the strided GT alongside pred so eval can use a matched file.
+        if self.frame_stride > 1 and self.poses_path is not None:
+            gt_full = load_poses(self.poses_path)
+            gt_strided = gt_full[::self.frame_stride]
+            gt_out = os.path.join(self.output_dir, "gt_strided.txt")
+            save_poses(gt_strided, gt_out)
+            print(f"Saved strided GT ({len(gt_strided)} of {len(gt_full)}) → {gt_out}")
 
         if self.acc_pts:
             all_pts  = np.concatenate(self.acc_pts,  axis=0)
@@ -1412,12 +1476,16 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--gps_csv",    type=str, default=None,
                         help="Path to GPS CSV file for global alignment (optional)")
-    parser.add_argument("--kitti_poses", type=str, default=None,
-                        help="Path to KITTI GT poses file for GPS-PGO (e.g. poses/07.txt)")
+    parser.add_argument("--poses", type=str, default=None,
+                        help="Path to GT poses file for GPS-PGO. Accepts KITTI 12-float [R|t] "
+                             "(e.g. poses/07.txt) or TartanAir 7-float xyz+quat (pose_lcam_front.txt).")
     parser.add_argument("--gps_every_k", type=int, default=None,
                         help="Override GPS_PGO.gps_every_k from config (anchor every k-th chunk)")
     parser.add_argument("--gps_anchor_freq", type=int, default=None,
                         help="Override GPS_PGO.gps_anchor_freq from config (one 5-DOF factor every N frames)")
+    parser.add_argument("--frame_stride", type=int, default=1,
+                        help="Subsample input images (and aligned GT) by taking every Nth frame. "
+                             "Default 1 = no downsampling. Example: stride=30 on a 30 Hz sequence → 1 Hz.")
     rr.script_add_args(parser)  # adds --rr-addr, --save etc; must be called before parse_args
     args = parser.parse_args()
 
@@ -1451,7 +1519,8 @@ if __name__ == "__main__":
         warmup_numba()
 
     streamer = Any_StreamingRT(args.image_dir, args.output_dir, config,
-                               gps_csv=args.gps_csv, kitti_poses=args.kitti_poses)
+                               gps_csv=args.gps_csv, poses=args.poses,
+                               frame_stride=args.frame_stride)
     streamer.run()
 
     del streamer

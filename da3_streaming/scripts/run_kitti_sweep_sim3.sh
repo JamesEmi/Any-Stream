@@ -78,7 +78,7 @@ eval_one() {
         return
     fi
 
-    python -m eval.eval_kitti \
+    python -m eval.eval_traj \
         --gt "$gt_path" \
         --pred "$pred_file" \
         2>&1 | tee "$out_dir/eval_$(basename "$pred_file" .txt).log"
@@ -105,7 +105,7 @@ for seq in "${SEQS[@]}"; do
 
     for f in "${ANCHOR_FREQS[@]}"; do
         run_one "$seq" "pgo_anchfreq${f}" \
-            --kitti_poses "$gt_path" \
+            --poses "$gt_path" \
             --gps_anchor_freq "$f"
         eval_one "$seq" "pgo_anchfreq${f}" \
             "$EXP_ROOT/seq${seq}_pgo_anchfreq${f}/poses_pred_baseline.txt"
