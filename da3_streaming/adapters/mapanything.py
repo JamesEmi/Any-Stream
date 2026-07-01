@@ -13,6 +13,7 @@ class MapAnythingAdapter:
     def __init__(self, device: str = "cuda"):
         self.device = device
         self.model = None
+        self._k_prior_logged = False
 
     def load(self):
         """Load MapAnything model."""
@@ -24,21 +25,33 @@ class MapAnythingAdapter:
         print("MapAnything model loaded.")
 
     
-    def infer(self, image_paths: List[str]) -> Predictions:
+    def infer(self, image_paths: List[str], intrinsics=None) -> Predictions:
         """
         Run inference and return unified Predictions object.
-        
+
         Args:
             image_paths: List of paths to images
-            
+            intrinsics: Optional 3x3 K (numpy or torch) at the original image
+                resolution. When provided, attached to every view as a prior;
+                preprocess_inputs() (mapanything.utils.image) rescales it to
+                the patch-aligned tensor automatically.
+
         Returns:
             Predictions object with W2C extrinsics
         """
         from mapanything.utils.image import load_images
-        
+
         # 1. Load images
         views = load_images(image_paths)
         print(f"Loaded {len(views)} views")
+
+        if intrinsics is not None:
+            K_t = torch.as_tensor(intrinsics, dtype=torch.float32)
+            if not self._k_prior_logged:
+                print(f"[MapAnythingAdapter] attaching intrinsics prior:\n{K_t.numpy()}")
+                self._k_prior_logged = True
+            for v in views:
+                v["intrinsics"] = K_t
 
         # 2. Run inference
         with torch.no_grad():
@@ -47,7 +60,7 @@ class MapAnythingAdapter:
                                     #    confidence_percentile=10,
                                     #    apply_confidence_mask=True,
                                     # # apply_mask=True, # Apply masking to dense geometry outputs
-                                    # mask_edges=True, 
+                                    # mask_edges=True,
                                 )
 
         print("Inference complete!")
