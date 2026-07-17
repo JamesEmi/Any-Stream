@@ -191,6 +191,16 @@ class Any_StreamingRT:
             self.model = VGGTAdapter(device=self.device)
             self.model.load()
 
+        elif model_type == "VGGT_OMEGA":
+            from adapters.vggt import VGGTAdapter
+            self.model = VGGTAdapter(
+                device=self.device,
+                model_name="vggt_omega",
+                resolution_set=512,
+                patch_size=16,
+            )
+            self.model.load()
+
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -243,7 +253,7 @@ class Any_StreamingRT:
                     intrinsics_prior=self._intrinsics_prior,
                 )
 
-            elif self.model_type == "VGGT":
+            elif self.model_type in ("VGGT", "VGGT_OMEGA"):
                 predictions = self.model.infer(image_paths)
 
         infer_time = time.time() - t0
