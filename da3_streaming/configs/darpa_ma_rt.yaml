@@ -5,8 +5,8 @@ Weights:
   SALAD: '/mnt/data/any-stream/any-stream/weights/dino_salad.ckpt'
 
 Model:
-  chunk_size: 160
-  overlap: 40
+  chunk_size: 16
+  overlap: 4
   loop_chunk_size: 20
   loop_enable: False
   useDBoW: False
@@ -35,7 +35,7 @@ Model:
     tol: 1e-9
 
   Pointcloud_Save:
-    sample_ratio: 1.0
+    sample_ratio: 0.05
     conf_threshold_coef: 0.75
     use_conf_filtering: False   # MapAnything → mask-based filtering
 

@@ -377,11 +377,12 @@ class Any_StreamingRT:
         """
         n = len(predictions.depth)
         ov = self.overlap
+        is_last_chunk = (chunk_idx == len(self.chunk_indices) - 1)
 
-        if chunk_idx == 0:
-            sl = slice(0, n - ov)
-        else:
-            sl = slice(ov, n)
+        # da3_streaming convention: every chunk saves its head [0, n - ov), so the
+        # overlap region between chunk N and chunk N+1 is owned by chunk N+1's predictions.
+        # The very last chunk has no successor, so it keeps its tail.
+        sl = slice(0, n) if is_last_chunk else slice(0, n - ov)
 
         depth  = predictions.depth[sl]
         images = predictions.processed_images[sl]
@@ -408,12 +409,9 @@ class Any_StreamingRT:
             pts = apply_sim3_direct_torch(pts, s_abs, R_abs, t_abs)  # [N, H, W, 3] numpy
             cam_pos = (s_abs * (cam_pos @ R_abs.T) + t_abs).astype(np.float32)
 
-        # Non-overlap frame paths
+        # Frame paths for the saved frames (matches `sl` above).
         if chunk_paths is not None:
-            if chunk_idx == 0:
-                frame_paths = chunk_paths[:n - ov]
-            else:
-                frame_paths = chunk_paths[ov:]
+            frame_paths = chunk_paths if is_last_chunk else chunk_paths[:n - ov]
         else:
             frame_paths = []
 
@@ -960,11 +958,9 @@ class Any_StreamingRT:
             n_local = c2w_local.shape[0]
             if n_local < 2:
                 continue
-            # local→global frame mapping for this chunk (matches accumulation logic)
-            if k == 0:
-                global_start = start
-            else:
-                global_start = start + ov
+            # local→global frame mapping for this chunk (matches accumulation logic).
+            # i-th saved frame is at global index `start + i` for all chunks.
+            global_start = start
 
             c_loc_all = c2w_local[:, :3, 3].astype(np.float64)   # (n_local, 3)
             # local velocity direction by central diff (fwd/bwd at boundaries)
@@ -1161,15 +1157,16 @@ class Any_StreamingRT:
             self.acc_cam_positions.append(cam_pos)
             self.frame_image_paths.extend(frame_paths)
 
-            # Collect per-frame c2w poses for evaluation
+            # Collect per-frame c2w poses for evaluation (da3_streaming convention).
             n_frames = len(cur_pred.depth)
             ov = self.overlap
-            if chunk_idx == 0:
+            is_last_chunk = (chunk_idx == n_chunks - 1)
+            if is_last_chunk:
+                sl = slice(0, n_frames)
+                global_indices = list(range(start, end))
+            else:
                 sl = slice(0, n_frames - ov)
                 global_indices = list(range(start, start + n_frames - ov))
-            else:
-                sl = slice(ov, n_frames)
-                global_indices = list(range(start + ov, end))
             c2w_local = self._w2c_to_c2w(cur_pred.extrinsics[sl])
             self._acc_frame_c2w_local.append(c2w_local.copy())
             if chunk_idx > 0:

@@ -20,7 +20,7 @@ Model:
   ref_view_strategy_loop: 'saddle_balanced'
   depth_threshold: 15.0
 
-  save_depth_conf_result: True
+  save_depth_conf_result: False
   save_debug_info: False
 
   inject_pred_intrinsics: true   # chunk 0's median K reused as prior for all later chunks (MA only)
@@ -35,7 +35,7 @@ Model:
     tol: 1e-9
 
   Pointcloud_Save:
-    sample_ratio: 1.0
+    sample_ratio: 0.05
     conf_threshold_coef: 0.75
     use_conf_filtering: False   # MapAnything → mask-based filtering
 
@@ -52,7 +52,8 @@ Loop:
     lang_version: 'python'
     max_iterations: 30
     lambda_init: 1e-6
-    gps_sigma_t: 0.01    # GPS unary fallback σ (m)
+    init_method: 'umeyama'   # "anchored" (per-chunk GPS init) | "umeyama" (legacy)
+    gps_sigma_t: 0.5    # GPS unary fallback σ (m)
     # seq_sigma = joint rot/trans fallback; seq_sigma_R / seq_sigma_t override when set.
     # Split lets us weld rotation to VO while keeping translation GPS-correctable.
     seq_sigma: 0.1

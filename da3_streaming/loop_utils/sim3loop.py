@@ -610,6 +610,10 @@ class Sim3LoopOptimizer:
         cfg = self.config["Loop"]["SIM3_Optimizer"]
         heading_sigma = float(cfg.get("heading_sigma", 0.1))
         gps_sigma_t = float(cfg.get("gps_sigma_t", 0.1))
+        # Per-chunk PGO init: "anchored" sets each chunk's translation from its median
+        # GPS observation so per-frame factor residuals are near-zero at init (avoids LM
+        # rejecting the first step). "umeyama" uses the original t_k = s_g * R_g @ t_m + t_g.
+        init_method = str(cfg.get("init_method", "anchored")).lower()
         # Between-factor rot/trans can be set jointly via seq_sigma (isotropic fallback)
         # or independently via seq_sigma_R / seq_sigma_t. The split lets us weld chunk
         # rotation to VO (seq_sigma_R small) while keeping translation loose so GPS
@@ -625,13 +629,39 @@ class Sim3LoopOptimizer:
         abs_poses_model = self.sequential_to_absolute_poses(sequential_transforms)
         n_chunks = abs_poses_model.shape[0]
 
-        # initial Similarity3 per chunk = Umeyama ∘ model-frame absolute
+        # Group GPS measurements by chunk so we can anchor each chunk's translation
+        # at its actual GPS observation when init_method == "anchored". Without this,
+        # when |t_g| or |R_g - I| is large the per-frame factor residuals are meters
+        # at init and LM rejects the first step (0 iterations, no progress).
+        chunk_meas = {}
+        if init_method == "anchored":
+            for m in gps_measurements:
+                k = int(m["chunk_k"])
+                if not (0 <= k < n_chunks):
+                    continue
+                c_loc = np.asarray(m["c_loc"], dtype=np.float64).reshape(3)
+                p_obs = np.asarray(m["p_obs"], dtype=np.float64).reshape(3)
+                if np.all(np.isfinite(c_loc)) and np.all(np.isfinite(p_obs)):
+                    chunk_meas.setdefault(k, []).append((c_loc, p_obs))
+
+        # initial Similarity3 per chunk:
+        #   - rotation: R_g @ R_m  (Umeyama composed with model-frame absolute)
+        #   - scale:    s_g * s_m
+        #   - translation:
+        #       "anchored":  t_k = p_obs - s_k * R_k @ c_loc using the chunk's MEDIAN
+        #                    GPS measurement, so per-frame residuals are ~zero at init.
+        #       "umeyama":   t_k = s_g * R_g @ t_m + t_g  (original implementation).
         init_sim3 = []
         for k in range(n_chunks):
             s_m, R_m, t_m = self.pypose_sim3_to_numpy(pp.Sim3(abs_poses_model[k]))
             s_k = float(s_g) * float(s_m)
             R_k = R_g @ R_m
-            t_k = s_g * (R_g @ t_m) + t_g
+            if init_method == "anchored" and k in chunk_meas:
+                meas = chunk_meas[k]
+                c_loc_rep, p_obs_rep = meas[len(meas) // 2]
+                t_k = p_obs_rep - s_k * (R_k @ c_loc_rep)
+            else:
+                t_k = s_g * (R_g @ t_m) + t_g
             init_sim3.append(gtsam.Similarity3(gtsam.Rot3(R_k), gtsam.Point3(*t_k), s_k))
 
         graph = gtsam.NonlinearFactorGraph()
@@ -702,7 +732,8 @@ class Sim3LoopOptimizer:
         final_error = lm.error()
         iterations = lm.iterations()
         print(f"  [GPS-PGO-Sim3] {n_gps_factors} GPS factors, {n_chunks - 1} between factors")
-        print(f"  [GPS-PGO-Sim3] sigmas: head={heading_sigma}  gps_t={gps_sigma_t}  "
+        print(f"  [GPS-PGO-Sim3] init={init_method}  "
+              f"sigmas: head={heading_sigma}  gps_t={gps_sigma_t}  "
               f"seq_R={seq_sigma_R}  seq_t={seq_sigma_t}  seq_s={seq_sigma_scale}")
         print(f"  [GPS-PGO-Sim3] LM: initial error={initial_error:.6f}  "
               f"final error={final_error:.6f}  iterations={iterations}")
