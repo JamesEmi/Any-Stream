@@ -20,18 +20,44 @@ class VGGTAdapter:
         model_name: str = "vggt",
         resolution_set: int = 518,
         patch_size: int = 14,
+        checkpoint_path: str = None,
     ):
         self.device = device
         self.model_name = model_name
         self.resolution_set = resolution_set
         self.patch_size = patch_size
+        self.checkpoint_path = checkpoint_path
         self.model = None
 
     def load(self):
-        """Load model via MapAnything's init_model_from_config."""
-        from mapanything.models import init_model_from_config
+        """Load model via MapAnything's model factory.
 
-        self.model = init_model_from_config(self.model_name, device=self.device)
+        When ``checkpoint_path`` is given, override the model config's
+        ``checkpoint_path`` directly so MapAnything's machine config (which
+        provides ``root_pretrained_checkpoints_dir``, unset/``???`` on a fresh
+        upstream clone) is never consulted. Otherwise fall back to the default
+        config-driven resolution.
+        """
+        from mapanything.models import init_model, init_model_from_config
+
+        if self.checkpoint_path:
+            import os
+            import mapanything
+            from omegaconf import OmegaConf
+
+            repo_root = os.path.dirname(
+                os.path.dirname(os.path.abspath(mapanything.__file__))
+            )
+            model_cfg = OmegaConf.load(
+                os.path.join(repo_root, "configs", "model", f"{self.model_name}.yaml")
+            )
+            model_cfg.model_config.checkpoint_path = self.checkpoint_path
+            self.model = init_model(
+                model_cfg.model_str, model_cfg.model_config
+            ).to(self.device)
+        else:
+            self.model = init_model_from_config(self.model_name, device=self.device)
+
         self.model.eval()
         print(f"{self.model_name} model loaded.")
 
