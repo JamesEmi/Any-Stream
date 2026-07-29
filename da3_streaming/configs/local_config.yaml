@@ -1,3 +1,4 @@
+# WARNING: This is a TEMPLATE ONLY. The final config lives in ${AIRLAB_PATH}/config/reid/anystream
 Weights:
   model: 'DA3' # DA3 or MapAnything
   DA3: '/mnt/data/any-stream/any-stream/weights/model.safetensors'
