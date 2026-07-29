@@ -6,10 +6,10 @@ Weights:
   SALAD: '/mnt/data/any-stream/any-stream/weights/dino_salad.ckpt'
 
 Model:
-  chunk_size: 5
-  overlap: 2
+  chunk_size: 16
+  overlap: 4
   loop_chunk_size: 5 # imgs of loop chunk = 2 * loop_chunk_size
-  loop_enable: False #True
+  loop_enable: False # True
   useDBoW: False
   delete_temp_files: True
   align_lib: 'triton' # choose among 'triton' (GPU), 'torch' (GPU), 'numba' (CPU) or 'numpy' (CPU)
