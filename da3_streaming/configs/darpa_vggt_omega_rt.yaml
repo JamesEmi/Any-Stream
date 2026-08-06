@@ -5,8 +5,8 @@ Weights:
   SALAD: '/mnt/data/any-stream/any-stream/weights/dino_salad.ckpt'
 
 Model:
-  chunk_size: 16
-  overlap: 4
+  chunk_size: 30
+  overlap: 10
   loop_chunk_size: 20
   loop_enable: False
   useDBoW: False

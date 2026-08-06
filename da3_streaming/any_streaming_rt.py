@@ -51,6 +51,14 @@ from eval.pose_utils import load_poses, save_poses
 R_Z_UP = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float32)
 
 
+def _chunk_color(idx: int):
+    """Well-separated RGB color per chunk index via golden-ratio hue hashing."""
+    import colorsys
+    h = (idx * 0.6180339887498949) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(h, 0.85, 1.0)
+    return [int(r * 255), int(g * 255), int(b * 255)]
+
+
 def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
     """
     depth: [N, H, W] numpy array or torch tensor
@@ -476,6 +484,21 @@ class Any_StreamingRT:
             ))
             if len(traj_viz) >= 2:
                 rr.log("trajectories/pred_line", rr.LineStrips3D([traj_viz], colors=[[255, 255, 255]]))
+
+        # Per-chunk colored segments (debug seam alignment)
+        for ci, cam_pos in enumerate(self.acc_cam_positions):
+            if len(cam_pos) == 0:
+                continue
+            col = _chunk_color(ci)
+            seg_viz = (R_Z_UP @ cam_pos.T).T
+            rr.log(f"trajectories/pred_chunks/chunk_{ci:04d}", rr.Points3D(
+                positions=seg_viz,
+                colors=np.full((len(seg_viz), 3), col, dtype=np.uint8),
+                radii=0.3,
+            ))
+            if len(seg_viz) >= 2:
+                rr.log(f"trajectories/pred_chunks/chunk_{ci:04d}_line",
+                       rr.LineStrips3D([seg_viz], colors=[col]))
 
     def _compute_gps_alignment(self):
         """
