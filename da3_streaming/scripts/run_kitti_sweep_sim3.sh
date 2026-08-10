@@ -78,7 +78,7 @@ eval_one() {
         return
     fi
 
-    python -m eval.eval_traj \
+    python -m evaluation.eval_traj \
         --gt "$gt_path" \
         --pred "$pred_file" \
         2>&1 | tee "$out_dir/eval_$(basename "$pred_file" .txt).log"

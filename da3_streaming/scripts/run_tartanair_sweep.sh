@@ -51,7 +51,7 @@ prepare_eval_gt() {
         mkdir -p "$(dirname "$gt_dst")"
         python -c "
 import sys; sys.path.insert(0, '.')
-from eval.pose_utils import load_poses, save_poses
+from evaluation.pose_utils import load_poses, save_poses
 gt = load_poses('$gt_src')
 if $FRAME_STRIDE > 1:
     gt = gt[::$FRAME_STRIDE]
@@ -115,7 +115,7 @@ eval_one() {
         return
     fi
 
-    python -m eval.eval_traj \
+    python -m evaluation.eval_traj \
         --gt "$gt_path" \
         --pred "$pred_file" \
         2>&1 | tee "$out_dir/eval_$(basename $pred_file .txt).log"

@@ -8,7 +8,7 @@ GT and pred can each be in either KITTI 12-float [R|t] format or TartanAir
 import argparse
 import numpy as np
 
-from eval.pose_utils import load_poses, load_kitti_timestamps, poses_to_evo
+from evaluation.pose_utils import load_poses, load_kitti_timestamps, poses_to_evo
 
 from evo.core.metrics import PoseRelation, Unit
 import evo.main_ape as main_ape

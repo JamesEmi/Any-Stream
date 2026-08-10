@@ -25,7 +25,6 @@ import time
 from datetime import datetime
 
 import numpy as np
-import rerun as rr
 import torch
 from loop_utils.alignment_torch import (
     apply_sim3_direct_torch,
@@ -43,7 +42,44 @@ from loop_utils.sim3utils import (
 from safetensors.torch import load_file
 from depth_anything_3.api import DepthAnything3
 from viz_ply_cas import read_gps_csv, build_enu_interpolator, extract_ts_ns, umeyama_alignment
-from eval.pose_utils import load_poses, save_poses
+from evaluation.pose_utils import load_poses, save_poses
+
+try:
+    import rerun as rr
+    _HAS_RERUN = True
+except ImportError:
+    _HAS_RERUN = False
+
+    class _RerunStub:
+        """No-op stand-in so this module imports without rerun installed.
+
+        Only the CLI entrypoint below genuinely needs rerun. Importers that just
+        want Any_StreamingRT (or the helpers in this module) should not be forced
+        to install a visualisation dependency. Every attribute resolves to a
+        callable returning another stub, so `rr.log(...)`, `rr.Points3D(...)`,
+        `rr.ViewCoordinates.RDF` and friends are all inert.
+
+        TODO: replace with an explicit RerunLogger + null-logger pair. The `rr.*`
+        calls are currently inline throughout run(), which is what forces the
+        catch-all __getattr__ here; hoisting them behind a named interface would
+        make the no-rerun path explicit rather than magic.
+        """
+
+        def __call__(self, *args, **kwargs):
+            return self
+
+        def __getattr__(self, name):
+            return self
+
+    rr = _RerunStub()
+    # print rather than warnings.warn: several libraries pulled in above install
+    # global filters that swallow RuntimeWarning, and this notice must not be
+    # silently dropped. Matches the fallback notice in loop_utils/sim3loop.py.
+    print(
+        "[any_streaming_rt] rerun is not installed; visualisation logging is "
+        "disabled. Install with: pip install rerun-sdk",
+        file=sys.stderr,
+    )
 
 # OpenCV world (Y-down, Z-forward) → Z-up viz. Applied at log time to all
 # model-frame quantities (pointcloud, trajectory, camera Transform3D).
@@ -1478,6 +1514,12 @@ class Any_StreamingRT:
         print("Done.")
 
 if __name__ == "__main__":
+    if not _HAS_RERUN:
+        sys.exit(
+            "rerun is required to run this script directly (it drives the live "
+            "visualisation and --rr-* CLI flags). Install with: pip install rerun-sdk"
+        )
+
     parser = argparse.ArgumentParser(description="DA3/MapAnything Real-time Streaming (RAM) with Rerun")
     parser.add_argument("--image_dir",  type=str, required=True)
     parser.add_argument("--config",     type=str, default="./configs/base_config.yaml")
