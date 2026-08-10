@@ -14,6 +14,7 @@
 #
 # Adapted from [VGGT-Long](https://github.com/DengKaiCQ/VGGT-Long)
 
+import sys
 import time
 from typing import List, Optional, Tuple
 import numpy as np
@@ -21,7 +22,6 @@ import pypose as pp
 import torch
 from fastloop.solve_python import solve_system_py
 from scipy.spatial.transform import Rotation as R
-import gtsam
 
 cpp_version = False
 try:
@@ -31,7 +31,47 @@ try:
 except Exception:
     print("Sim3solve of C++ Version failed, Will using Python Version.")
 
-class Sim3GPSFactor(gtsam.CustomFactor):
+# gtsam is only needed for the GPS pose-graph optimisation (optimize_gps and
+# optimize_gps_sim3). Loop closure and the Sim3 alignment path below work
+# without it, so importing this module must not require it — anystream_ros
+# imports its siblings in loop_utils on a deployment machine.
+_HAS_GTSAM = False
+try:
+    import gtsam
+
+    _HAS_GTSAM = True
+except ImportError:
+    gtsam = None
+    print(
+        "[sim3loop] gtsam not installed; GPS pose-graph optimisation is "
+        "unavailable. Install with: pip install gtsam",
+        file=sys.stderr,
+    )
+
+
+def _require_gtsam(what: str):
+    """Raise a clear error when a gtsam-only code path is entered without it."""
+    if not _HAS_GTSAM:
+        raise ImportError(
+            f"{what} requires gtsam, which is not installed. "
+            f"Install with: pip install gtsam"
+        )
+
+
+if _HAS_GTSAM:
+    _CustomFactorBase = gtsam.CustomFactor
+else:
+    class _CustomFactorBase:
+        """Placeholder base so Sim3GPSFactor can still be defined without gtsam.
+
+        Constructing one raises; the class only needs to exist at import time.
+        """
+
+        def __init__(self, *args, **kwargs):
+            _require_gtsam("Sim3GPSFactor")
+
+
+class Sim3GPSFactor(_CustomFactorBase):
     """
     5-DOF GPS factor on a gtsam.Similarity3 chunk pose.
 
@@ -486,11 +526,13 @@ class Sim3LoopOptimizer:
         max_iterations: int = None,
         lambda_init: float = None,
     ):
+        _require_gtsam("optimize_gps")
+
         if max_iterations is None:
             max_iterations = self.config["Loop"]["SIM3_Optimizer"]["max_iterations"]
         if lambda_init is None:
             lambda_init = eval(self.config["Loop"]["SIM3_Optimizer"]["lambda_init"])
-        
+
         s_g, R_g, t_g = umeyama
 
         # build init abs poses in model frame -> project to GPS
@@ -602,6 +644,8 @@ class Sim3LoopOptimizer:
 
         Returns per-chunk absolute GPS-frame Sim3 tuples (s_k, R_k, t_k).
         """
+        _require_gtsam("optimize_gps_sim3")
+
         if max_iterations is None:
             max_iterations = self.config["Loop"]["SIM3_Optimizer"]["max_iterations"]
         if lambda_init is None:

@@ -22,3 +22,5 @@ plyfile
 pillow_heif
 safetensors
 pycolmap
+gtsam
+pymap3d
