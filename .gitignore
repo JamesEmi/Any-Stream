@@ -33,3 +33,8 @@ input_images*/
 src/debug_main.py
 temp*.png
 /outputs
+
+# Run outputs and generated visualisation assets
+exps/
+da3_streaming/media/
+da3_streaming/viz/
