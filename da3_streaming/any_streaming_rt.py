@@ -185,7 +185,7 @@ class Any_StreamingRT:
             from adapters.mapanything import MapAnythingAdapter
             self.model = MapAnythingAdapter(device=self.device)
             self.model.load()
-
+        
         elif model_type == "VGGT":
             from adapters.vggt import VGGTAdapter
             self.model = VGGTAdapter(device=self.device)
@@ -198,6 +198,7 @@ class Any_StreamingRT:
                 model_name="vggt_omega",
                 resolution_set=512,
                 patch_size=16,
+                checkpoint_path=config["Weights"].get("VGGT_OMEGA"),
             )
             self.model.load()
 
@@ -250,7 +251,7 @@ class Any_StreamingRT:
             elif self.model_type == "MapAnything":
                 predictions = self.model.infer(
                     image_paths,
-                    intrinsics_prior=self._intrinsics_prior,
+                    intrinsics=self._intrinsics_prior,
                 )
 
             elif self.model_type in ("VGGT", "VGGT_OMEGA"):

@@ -13,6 +13,7 @@ class MapAnythingAdapter:
     def __init__(self, device: str = "cuda"):
         self.device = device
         self.model = None
+        self._k_prior_logged = False
 
     def load(self):
         """Load MapAnything model."""
@@ -24,15 +25,16 @@ class MapAnythingAdapter:
         print("MapAnything model loaded.")
 
     
-    def infer(self, image_paths: List[str], intrinsics_prior=None) -> Predictions:
+    def infer(self, image_paths: List[str], intrinsics=None) -> Predictions:
         """
         Run inference and return unified Predictions object.
 
         Args:
             image_paths: List of paths to images
-            intrinsics_prior: optional (3, 3) ndarray. If provided, injected into
-                every view's 'intrinsics' key so MA conditions on it instead of
-                re-predicting per chunk.
+            intrinsics: Optional 3x3 K (numpy or torch) at the original image
+                resolution. When provided, attached to every view as a prior;
+                preprocess_inputs() (mapanything.utils.image) rescales it to
+                the patch-aligned tensor automatically.
 
         Returns:
             Predictions object with W2C extrinsics
@@ -43,15 +45,15 @@ class MapAnythingAdapter:
         views = load_images(image_paths)
         print(f"Loaded {len(views)} views")
 
-        # 2. Optionally inject intrinsics prior
-        if intrinsics_prior is not None:
-            K = torch.as_tensor(
-                np.asarray(intrinsics_prior, dtype=np.float32)
-            ).to(self.device)
+        if intrinsics is not None:
+            K_t = torch.as_tensor(intrinsics, dtype=torch.float32)
+            if not self._k_prior_logged:
+                print(f"[MapAnythingAdapter] attaching intrinsics prior:\n{K_t.numpy()}")
+                self._k_prior_logged = True
             for v in views:
-                v["intrinsics"] = K[None]   # (1, 3, 3) to match per-view B=1
+                v["intrinsics"] = K_t
 
-        # 3. Run inference
+        # 2. Run inference
         with torch.no_grad():
             outputs = self.model.infer(views,
                                     #    use_multiview_confidence=True,
