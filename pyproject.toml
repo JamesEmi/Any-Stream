@@ -41,6 +41,7 @@ dependencies = [
     "pycolmap",
     "gtsam",
     "pymap3d",
+    "pypose",
 ]
 
 [project.optional-dependencies]
