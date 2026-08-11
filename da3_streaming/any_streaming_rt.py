@@ -49,42 +49,16 @@ from loop_utils.gps_utils import (
 )
 from evaluation.pose_utils import load_poses, save_poses
 
-try:
-    import rerun as rr
-    _HAS_RERUN = True
-except ImportError:
-    _HAS_RERUN = False
+from rerun_logging import HAS_RERUN, RerunLogger, build_logger
 
-    class _RerunStub:
-        """No-op stand-in so this module imports without rerun installed.
-
-        Only the CLI entrypoint below genuinely needs rerun. Importers that just
-        want Any_StreamingRT (or the helpers in this module) should not be forced
-        to install a visualisation dependency. Every attribute resolves to a
-        callable returning another stub, so `rr.log(...)`, `rr.Points3D(...)`,
-        `rr.ViewCoordinates.RDF` and friends are all inert.
-
-        TODO: replace with an explicit RerunLogger + null-logger pair. The `rr.*`
-        calls are currently inline throughout run(), which is what forces the
-        catch-all __getattr__ here; hoisting them behind a named interface would
-        make the no-rerun path explicit rather than magic.
-        """
-
-        def __call__(self, *args, **kwargs):
-            return self
-
-        def __getattr__(self, name):
-            return self
-
-    rr = _RerunStub()
-    # print rather than warnings.warn: several libraries pulled in above install
-    # global filters that swallow RuntimeWarning, and this notice must not be
-    # silently dropped. Matches the fallback notice in loop_utils/sim3loop.py.
-    print(
-        "[any_streaming_rt] rerun is not installed; visualisation logging is "
-        "disabled. Install with: pip install rerun-sdk",
-        file=sys.stderr,
-    )
+# Trajectory colours, shared by the logging call sites below.
+COLOR_PRED = (255, 255, 255)
+COLOR_GT = (0, 255, 0)
+COLOR_GPS = (0, 255, 0)
+COLOR_PRED_GPS = (0, 0, 255)
+COLOR_ANCHOR = (255, 0, 0)
+COLOR_BASELINE = (255, 220, 0)
+COLOR_PGO = (0, 220, 255)
 
 # OpenCV world (Y-down, Z-forward) → Z-up viz. Applied at log time to all
 # model-frame quantities (pointcloud, trajectory, camera Transform3D).
@@ -153,10 +127,11 @@ def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
 
 class Any_StreamingRT:
     def __init__(self, image_dir, save_dir, config, gps_csv=None, poses=None,
-                 frame_stride=1):
+                 frame_stride=1, viz: RerunLogger = None):
         self.config = config
         self.poses_path = poses
         self.frame_stride = max(1, int(frame_stride))
+        self.viz = viz if viz is not None else build_logger()
 
         self.chunk_size = self.config["Model"]["chunk_size"]
         self.overlap = self.config["Model"]["overlap"]
@@ -500,11 +475,9 @@ class Any_StreamingRT:
             all_pts  = all_pts[idx]
             all_cols = all_cols[idx]
 
-        rr.set_time("stable_time", sequence=self._rr_time)
+        self.viz.set_time("stable_time", self._rr_time)
         self._rr_time += 1
-        rr.log("map/pointcloud", rr.Points3D(
-            positions=(R_Z_UP @ all_pts.T).T, colors=all_cols
-        ))
+        self.viz.pointcloud("map/pointcloud", (R_Z_UP @ all_pts.T).T, all_cols)
         print(f"  [rerun] {len(all_pts):,} pts logged  "
               f"(total acc: {sum(len(p) for p in self.acc_pts):,})")
 
@@ -512,12 +485,7 @@ class Any_StreamingRT:
         if self.acc_cam_positions:
             traj = np.concatenate(self.acc_cam_positions, axis=0).astype(np.float32)
             traj_viz = (R_Z_UP @ traj.T).T
-            rr.log("trajectories/pred", rr.Points3D(
-                positions=traj_viz,
-                colors=np.full((len(traj_viz), 3), [255, 255, 255], dtype=np.uint8),
-            ))
-            if len(traj_viz) >= 2:
-                rr.log("trajectories/pred_line", rr.LineStrips3D([traj_viz], colors=[[255, 255, 255]]))
+            self.viz.trajectory("trajectories/pred", traj_viz, COLOR_PRED)
 
     def _compute_gps_alignment(self):
         """
@@ -574,31 +542,17 @@ class Any_StreamingRT:
             global_pts = global_pts[idx]
             global_cols = global_cols[idx]
 
-        rr.set_time("stable_time", sequence=self._rr_time - 1)  # same timestep as local log
-        rr.log("map/global_pointcloud", rr.Points3D(positions=global_pts, colors=global_cols))
+        self.viz.set_time("stable_time", self._rr_time - 1)  # same timestep as local log
+        self.viz.pointcloud("map/global_pointcloud", global_pts, global_cols)
 
         # Predicted trajectory in GPS frame (blue)
         all_cam = np.concatenate(self.acc_cam_positions, axis=0)
         cam_global = (s_gps * (all_cam.astype(np.float64) @ R_gps.T) + t_gps).astype(np.float32)
-        rr.log("map/trajectory_pred", rr.Points3D(
-            positions=cam_global,
-            colors=np.full((len(cam_global), 3), [0, 0, 255], dtype=np.uint8),
-        ))
-        if len(cam_global) >= 2:
-            rr.log("map/trajectory_pred_line", rr.LineStrips3D(
-                [cam_global], colors=[[0, 0, 255]],
-            ))
+        self.viz.trajectory("map/trajectory_pred", cam_global, COLOR_PRED_GPS)
 
         # GPS ground truth (green)
         gps_f32 = gps_matched.astype(np.float32)
-        rr.log("map/trajectory_gps", rr.Points3D(
-            positions=gps_f32,
-            colors=np.full((len(gps_f32), 3), [0, 255, 0], dtype=np.uint8),
-        ))
-        if len(gps_f32) >= 2:
-            rr.log("map/trajectory_gps_line", rr.LineStrips3D(
-                [gps_f32], colors=[[0, 255, 0]],
-            ))
+        self.viz.trajectory("map/trajectory_gps", gps_f32, COLOR_GPS)
 
         print(f"  [rerun/gps] {len(global_pts):,} pts, "
               f"{len(cam_global)} pred poses, {len(gps_f32)} gps poses")
@@ -729,14 +683,7 @@ class Any_StreamingRT:
         """
         n_gt = min(len(poses), sum(len(p) for p in self.acc_cam_positions))
         gt_pos_all = poses[:n_gt, :3, 3].astype(np.float32)
-        rr.log("trajectories/gt", rr.Points3D(
-            positions=gt_pos_all,
-            colors=np.full((len(gt_pos_all), 3), [0, 255, 0], dtype=np.uint8),
-        ), static=True)
-        if len(gt_pos_all) >= 2:
-            rr.log("trajectories/gt_line", rr.LineStrips3D(
-                [gt_pos_all], colors=[[0, 255, 0]],
-            ), static=True)
+        self.viz.trajectory("trajectories/gt", gt_pos_all, COLOR_GT, static=True)
 
     def _log_gps_anchors_rerun(self, anchor_positions: np.ndarray):
         """
@@ -751,11 +698,8 @@ class Any_StreamingRT:
         pts = anchor_positions[valid].astype(np.float32)
         if len(pts) == 0:
             return
-        rr.log("trajectories/gps_anchors", rr.Points3D(
-            positions=pts,
-            colors=np.full((len(pts), 3), [255, 0, 0], dtype=np.uint8),
-            radii=np.full(len(pts), 0.5, dtype=np.float32),
-        ), static=True)
+        self.viz.trajectory("trajectories/gps_anchors", pts, COLOR_ANCHOR,
+                            static=True, line=False, radius=0.5)
 
     def _log_gps_traj_rerun_gps_frame(self):
         """Log GPS CSV trajectory (raw ENU) as a static green line.
@@ -774,13 +718,7 @@ class Any_StreamingRT:
         if len(gps_enu) < 2:
             return
         gps_enu = np.array(gps_enu, dtype=np.float32)
-        rr.log("trajectories/gt", rr.Points3D(
-            positions=gps_enu,
-            colors=np.full((len(gps_enu), 3), [0, 255, 0], dtype=np.uint8),
-        ), static=True)
-        rr.log("trajectories/gt_line", rr.LineStrips3D(
-            [gps_enu], colors=[[0, 255, 0]],
-        ), static=True)
+        self.viz.trajectory("trajectories/gt", gps_enu, COLOR_GT, static=True)
 
     def _fit_gt_alignment(self, poses: np.ndarray):
         """Compute Umeyama alignment from predicted chunk positions to GT.
@@ -825,14 +763,7 @@ class Any_StreamingRT:
         n_gt = min(len(poses), sum(len(p) for p in self.acc_cam_positions))
         gt_pos_all = poses[:n_gt, :3, 3]
         gt_model = ((1.0 / s_g) * ((gt_pos_all - t_g) @ R_g)).astype(np.float32)
-        rr.log("trajectories/gt", rr.Points3D(
-            positions=gt_model,
-            colors=np.full((len(gt_model), 3), [0, 255, 0], dtype=np.uint8),
-        ), static=True)
-        if len(gt_model) >= 2:
-            rr.log("trajectories/gt_line", rr.LineStrips3D(
-                [gt_model], colors=[[0, 255, 0]],
-            ), static=True)
+        self.viz.trajectory("trajectories/gt", gt_model, COLOR_GT, static=True)
 
     def _shift_all_poses(self, delta: np.ndarray):
         """Rigidly shift acc_cam_positions, acc_frame_c2w, and acc_pts by delta (3,).
@@ -862,14 +793,7 @@ class Any_StreamingRT:
             return
         gps_enu = np.array(gps_enu, dtype=np.float64)
         gt_model = ((1.0 / s_g) * ((gps_enu - t_g) @ R_g)).astype(np.float32)
-        rr.log("trajectories/gt", rr.Points3D(
-            positions=gt_model,
-            colors=np.full((len(gt_model), 3), [0, 255, 0], dtype=np.uint8),
-        ), static=True)
-        if len(gt_model) >= 2:
-            rr.log("trajectories/gt_line", rr.LineStrips3D(
-                [gt_model], colors=[[0, 255, 0]],
-            ), static=True)
+        self.viz.trajectory("trajectories/gt", gt_model, COLOR_GT, static=True)
 
     def _fit_gps_csv_alignment(self):
         """Compute Umeyama alignment from predicted chunk positions to GPS CSV ENU.
@@ -1240,15 +1164,8 @@ class Any_StreamingRT:
                     gt_pos = self._poses_cache[:cur_end, :3, 3]
                     gt_model = ((1.0 / s_g) * ((gt_pos - t_g) @ R_g)).astype(np.float32)
                     gt_model_viz = (R_Z_UP @ gt_model.T).T
-                    rr.set_time("stable_time", sequence=self._rr_time)
-                    rr.log("trajectories/gt", rr.Points3D(
-                        positions=gt_model_viz,
-                        colors=np.full((len(gt_model_viz), 3), [0, 255, 0], dtype=np.uint8),
-                    ))
-                    if len(gt_model_viz) >= 2:
-                        rr.log("trajectories/gt_line", rr.LineStrips3D(
-                            [gt_model_viz], colors=[[0, 255, 0]]
-                        ))
+                    self.viz.set_time("stable_time", self._rr_time)
+                    self.viz.trajectory("trajectories/gt", gt_model_viz, COLOR_GT)
                 except Exception as e:
                     print(f"  [GPS-vis] Skipped chunk {chunk_idx}: {e}")
 
@@ -1267,45 +1184,39 @@ class Any_StreamingRT:
                     K_pred_np = np.asarray(cur_pred.intrinsics[sl])  # [K, 3, 3]
                     K_prior = self._intrinsics_prior  # (3,3) or None
                     for local_i, (fp, gfi) in enumerate(zip(frame_paths, global_indices)):
-                        rr.set_time("frame_idx", sequence=int(gfi))
+                        self.viz.set_time("frame_idx", int(gfi))
                         img = PILImage.open(fp).convert("RGB")
-                        rr.log("camera/image", rr.Image(np.array(img)))
-                        rr.log("depth",        rr.DepthImage(depth_np[local_i].astype(np.float32)))
-                        rr.log("confidence",   rr.DepthImage(conf_np[local_i].astype(np.float32)))
+                        self.viz.image("camera/image", np.array(img))
+                        self.viz.depth_image("depth", depth_np[local_i])
+                        self.viz.depth_image("confidence", conf_np[local_i])
                         K = K_pred_np[local_i]
-                        rr.log("intrinsics/fx/pred", rr.Scalars(float(K[0, 0])))
-                        rr.log("intrinsics/fy/pred", rr.Scalars(float(K[1, 1])))
-                        rr.log("intrinsics/cx/pred", rr.Scalars(float(K[0, 2])))
-                        rr.log("intrinsics/cy/pred", rr.Scalars(float(K[1, 2])))
+                        self.viz.scalar("intrinsics/fx/pred", K[0, 0])
+                        self.viz.scalar("intrinsics/fy/pred", K[1, 1])
+                        self.viz.scalar("intrinsics/cx/pred", K[0, 2])
+                        self.viz.scalar("intrinsics/cy/pred", K[1, 2])
                         if K_prior is not None:
-                            rr.log("intrinsics/fx/prior", rr.Scalars(float(K_prior[0, 0])))
-                            rr.log("intrinsics/fy/prior", rr.Scalars(float(K_prior[1, 1])))
-                            rr.log("intrinsics/cx/prior", rr.Scalars(float(K_prior[0, 2])))
-                            rr.log("intrinsics/cy/prior", rr.Scalars(float(K_prior[1, 2])))
+                            self.viz.scalar("intrinsics/fx/prior", K_prior[0, 0])
+                            self.viz.scalar("intrinsics/fy/prior", K_prior[1, 1])
+                            self.viz.scalar("intrinsics/cx/prior", K_prior[0, 2])
+                            self.viz.scalar("intrinsics/cy/prior", K_prior[1, 2])
 
                         # Camera frustum in world frame (same view as map/pointcloud)
                         c2w = c2w_world[local_i]  # (4, 4)
                         h_pin, w_pin = depth_np[local_i].shape[:2]
                         t_c2w = c2w[:3, 3].astype(np.float32)
                         R_c2w = c2w[:3, :3].astype(np.float32)
-                        rr.log(
+                        self.viz.camera_transform(
                             "map/camera",
-                            rr.Transform3D(
-                                translation=R_Z_UP @ t_c2w,
-                                mat3x3=R_Z_UP @ R_c2w,
-                            ),
+                            translation=R_Z_UP @ t_c2w,
+                            mat3x3=R_Z_UP @ R_c2w,
                         )
-                        rr.log(
+                        self.viz.pinhole(
                             "map/camera/pinhole",
-                            rr.Pinhole(
-                                image_from_camera=K.astype(np.float32),
-                                height=int(h_pin),
-                                width=int(w_pin),
-                                camera_xyz=rr.ViewCoordinates.RDF,
-                                image_plane_distance=1.0,
-                            ),
+                            image_from_camera=K,
+                            height=h_pin,
+                            width=w_pin,
                         )
-                        rr.log("map/camera/pinhole/rgb", rr.Image(np.array(img)))
+                        self.viz.image("map/camera/pinhole/rgb", np.array(img))
                 except Exception as e:
                     print(f"  [rerun] per-frame log failed: {e}")
 
@@ -1354,20 +1265,13 @@ class Any_StreamingRT:
         # Log baseline trajectory to Rerun (yellow, timestep N) — in GPS frame
         # if we have an alignment, otherwise in model frame as a fallback.
         if self.acc_cam_positions:
-            rr.set_time("stable_time", sequence=self._rr_time)
+            self.viz.set_time("stable_time", self._rr_time)
             baseline_traj = np.concatenate(self.acc_cam_positions, axis=0).astype(np.float64)
             if _alignment is not None:
                 s_g, R_g, t_g = _alignment[:3]
                 baseline_traj = (s_g * (baseline_traj @ R_g.T) + t_g)
             baseline_traj = baseline_traj.astype(np.float32)
-            rr.log("trajectories/baseline", rr.Points3D(
-                positions=baseline_traj,
-                colors=np.full((len(baseline_traj), 3), [255, 220, 0], dtype=np.uint8),
-            ))
-            if len(baseline_traj) >= 2:
-                rr.log("trajectories/baseline_line", rr.LineStrips3D(
-                    [baseline_traj], colors=[[255, 220, 0]],
-                ))
+            self.viz.trajectory("trajectories/baseline", baseline_traj, COLOR_BASELINE)
 
         # GT trajectory + optional GPS-PGO
         if self.poses_path is not None:
@@ -1385,16 +1289,9 @@ class Any_StreamingRT:
 
                 # Log PGO trajectory to Rerun (cyan, timestep N+1 → scrub to see correction)
                 self._rr_time += 1
-                rr.set_time("stable_time", sequence=self._rr_time)
+                self.viz.set_time("stable_time", self._rr_time)
                 pgo_traj = np.concatenate(self.acc_cam_positions, axis=0).astype(np.float32)
-                rr.log("trajectories/pgo", rr.Points3D(
-                    positions=pgo_traj,
-                    colors=np.full((len(pgo_traj), 3), [0, 220, 255], dtype=np.uint8),
-                ))
-                if len(pgo_traj) >= 2:
-                    rr.log("trajectories/pgo_line", rr.LineStrips3D(
-                        [pgo_traj], colors=[[0, 220, 255]],
-                    ))
+                self.viz.trajectory("trajectories/pgo", pgo_traj, COLOR_PGO)
 
                 # Re-log retransformed pointcloud at PGO timestep
                 if self.acc_pts:
@@ -1405,7 +1302,7 @@ class Any_StreamingRT:
                         idx = np.random.choice(len(all_pts), size=max_pts, replace=False)
                         all_pts  = all_pts[idx]
                         all_cols = all_cols[idx]
-                    rr.log("map/pointcloud", rr.Points3D(positions=all_pts, colors=all_cols))
+                    self.viz.pointcloud("map/pointcloud", all_pts, all_cols)
 
         elif self.gps_interp is not None:
             # _alignment was already fit above (so we could project the baseline).
@@ -1422,16 +1319,9 @@ class Any_StreamingRT:
                         self._save_poses(pgo_pose_path)
 
                         self._rr_time += 1
-                        rr.set_time("stable_time", sequence=self._rr_time)
+                        self.viz.set_time("stable_time", self._rr_time)
                         pgo_traj = np.concatenate(self.acc_cam_positions, axis=0).astype(np.float32)
-                        rr.log("trajectories/pgo", rr.Points3D(
-                            positions=pgo_traj,
-                            colors=np.full((len(pgo_traj), 3), [0, 220, 255], dtype=np.uint8),
-                        ))
-                        if len(pgo_traj) >= 2:
-                            rr.log("trajectories/pgo_line", rr.LineStrips3D(
-                                [pgo_traj], colors=[[0, 220, 255]],
-                            ))
+                        self.viz.trajectory("trajectories/pgo", pgo_traj, COLOR_PGO)
                         if self.acc_pts:
                             all_pts  = np.concatenate(self.acc_pts,  axis=0)
                             all_cols = np.concatenate(self.acc_cols, axis=0)
@@ -1441,8 +1331,7 @@ class Any_StreamingRT:
                                 all_pts  = all_pts[idx]
                                 all_cols = all_cols[idx]
                             # After PGO, acc_pts lives in GPS frame — log there
-                            rr.log("map/global_pointcloud",
-                                   rr.Points3D(positions=all_pts, colors=all_cols))
+                            self.viz.pointcloud("map/global_pointcloud", all_pts, all_cols)
                 else:
                     print("  [GPS-CSV] anchor_warp from GPS CSV not yet supported.")
 
@@ -1519,7 +1408,7 @@ class Any_StreamingRT:
         print("Done.")
 
 if __name__ == "__main__":
-    if not _HAS_RERUN:
+    if not HAS_RERUN:
         sys.exit(
             "rerun is required to run this script directly (it drives the live "
             "visualisation and --rr-* CLI flags). Install with: pip install rerun-sdk"
@@ -1541,7 +1430,7 @@ if __name__ == "__main__":
     parser.add_argument("--frame_stride", type=int, default=1,
                         help="Subsample input images (and aligned GT) by taking every Nth frame. "
                              "Default 1 = no downsampling. Example: stride=30 on a 30 Hz sequence → 1 Hz.")
-    rr.script_add_args(parser)  # adds --rr-addr, --save etc; must be called before parse_args
+    RerunLogger.add_cli_args(parser)  # adds --rr-addr, --save etc; must be called before parse_args
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -1566,16 +1455,17 @@ if __name__ == "__main__":
         print(f"  [warn] failed to copy config to output dir: {e}")
 
     # Rerun — mirrors demo_streaming_inference.py lines 441-443
-    rr.script_setup(args, "da3_streaming_rt")
-    rr.log("map", rr.ViewCoordinates.RDF, static=True)
-    rr.set_time("stable_time", sequence=0)
+    RerunLogger.setup(args, "da3_streaming_rt")
+    viz = build_logger()
+    viz.view_coordinates_rdf("map")
+    viz.set_time("stable_time", 0)
 
     if config["Model"]["align_lib"] == "numba":
         warmup_numba()
 
     streamer = Any_StreamingRT(args.image_dir, args.output_dir, config,
                                gps_csv=args.gps_csv, poses=args.poses,
-                               frame_stride=args.frame_stride)
+                               frame_stride=args.frame_stride, viz=viz)
     streamer.run()
 
     del streamer
