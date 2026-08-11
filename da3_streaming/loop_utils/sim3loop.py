@@ -54,7 +54,23 @@ def _require_gtsam(what: str):
     if not _HAS_GTSAM:
         raise ImportError(
             f"{what} requires gtsam, which is not installed. "
-            f"Install with: pip install gtsam"
+            f"Install with: pip install gtsam==4.3a1"
+        )
+
+
+def _require_gtsam_sim3(what: str):
+    """Additionally require the Similarity3 support added after gtsam 4.2.
+
+    gtsam 4.2 has no BetweenFactorSimilarity3 and cannot hold a Similarity3 in
+    Values, so the Sim3 pose graph fails deep inside pybind with an overload
+    error. Fail here with something actionable instead.
+    """
+    _require_gtsam(what)
+    if not hasattr(gtsam, "BetweenFactorSimilarity3"):
+        raise ImportError(
+            f"{what} needs gtsam >= 4.3a1 for Similarity3 support; the installed "
+            f"gtsam has no BetweenFactorSimilarity3. Install with: "
+            f"pip install --pre gtsam==4.3a1"
         )
 
 
@@ -644,7 +660,7 @@ class Sim3LoopOptimizer:
 
         Returns per-chunk absolute GPS-frame Sim3 tuples (s_k, R_k, t_k).
         """
-        _require_gtsam("optimize_gps_sim3")
+        _require_gtsam_sim3("optimize_gps_sim3")
 
         if max_iterations is None:
             max_iterations = self.config["Loop"]["SIM3_Optimizer"]["max_iterations"]
