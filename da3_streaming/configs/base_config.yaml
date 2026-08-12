@@ -52,3 +52,17 @@ Loop:
     # choose between 'cpp' or 'python'. will auto set 'python' if c++ version has not installed
     max_iterations: 30
     lambda_init: 1e-6
+    gps_sigma_t: 1.0      # isotropic GPS unary sigma (m); match the sensor's real accuracy
+    heading_sigma: 0.3    # GPS heading factor sigma
+    seq_sigma: 0.1        # sequential (odometry) edge fallback
+    seq_sigma_R: 0.01     # rotation tight to VO; translation stays GPS-correctable
+
+# GPS pose-graph optimisation.
+GPS_PGO:
+  enabled: true
+  method: 'pgo'
+  gps_every_k: 1            # solve every chunk; raise if solve time grows
+  gps_anchor_freq: 1        # one 5-DOF factor every N frames
+  gps_cov_isotropic: true   # ignore per-sample covariance, use gps_sigma_t
+  use_start_prior: false
+  max_solve_seconds: 5.0    # log a warning past this
